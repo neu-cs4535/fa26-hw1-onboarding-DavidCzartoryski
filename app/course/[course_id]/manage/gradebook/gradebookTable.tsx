@@ -20,6 +20,7 @@ import {
   useAreAllDependenciesReleased,
   useGradebookColumn,
   useGradebookColumnGrades,
+  useGradebookColumnGroups,
   useGradebookColumns,
   useGradebookController,
   useGradebookRefetchStatus,
@@ -27,6 +28,7 @@ import {
   useStudentDetailView
 } from "@/hooks/useGradebook";
 import { GradebookWhatIfProvider } from "@/hooks/useGradebookWhatIf";
+import { groupGradebookColumns, groupKeyByColumnId } from "@/lib/gradebookColumnGroups";
 import { createClient } from "@/utils/supabase/client";
 import {
   ClassSection,
@@ -224,6 +226,7 @@ type GradebookGroupedColumnRef = {
   sort_order: GradebookColumn["sort_order"];
   name: GradebookColumn["name"];
   max_score: GradebookColumn["max_score"];
+  group_id: GradebookColumn["group_id"];
 };
 
 /** Build left-to-right "units": each is a block of DB column ids. Collapsed groups = one unit (whole group). */
@@ -232,33 +235,19 @@ function buildVisibleReorderUnits(args: {
   groupedColumns: Record<string, { groupName: string; columns: GradebookGroupedColumnRef[] }>;
   collapsedGroups: Set<string>;
   findBestColumnToShow: (columns: GradebookGroupedColumnRef[]) => GradebookGroupedColumnRef;
-  gradebookColumns: { id: number; slug: string | null }[];
+  columnGroupKeys: Map<number, string>;
 }): number[][] {
-  const { scrollableLeafColumns, groupedColumns, collapsedGroups, findBestColumnToShow, gradebookColumns } = args;
+  const { scrollableLeafColumns, groupedColumns, collapsedGroups, findBestColumnToShow, columnGroupKeys } = args;
   const units: number[][] = [];
   for (const leaf of scrollableLeafColumns) {
     if (!String(leaf.id).startsWith("grade_")) continue;
     const colId = Number(String(leaf.id).slice(6));
-    const col = gradebookColumns.find((c) => c.id === colId);
-    if (!col?.slug) {
+    const groupKey = columnGroupKeys.get(colId);
+    const group = groupKey ? groupedColumns[groupKey] : undefined;
+    if (!group || group.columns.length <= 1) {
       units.push([colId]);
       continue;
     }
-    const slugParts = col.slug.split("-");
-    let baseGroupName: string;
-    if (slugParts[0] === "assignment" && slugParts.length >= 3) {
-      baseGroupName = `${slugParts[0]}-${slugParts[1]}`;
-    } else {
-      baseGroupName = slugParts[0] || "other";
-    }
-    const groupEntry = Object.entries(groupedColumns).find(
-      ([key, group]) => key.startsWith(baseGroupName) && group.columns.some((c) => c.id === colId)
-    );
-    if (!groupEntry || groupEntry[1].columns.length <= 1) {
-      units.push([colId]);
-      continue;
-    }
-    const group = groupEntry[1];
     const collapsed = collapsedGroups.has(group.groupName);
     if (collapsed) {
       const best = findBestColumnToShow(group.columns);
@@ -2446,6 +2435,7 @@ export default function GradebookTable() {
   const courseController = useCourseController();
   const gradebookController = useGradebookController();
   const gradebookColumns = useGradebookColumns();
+  const columnGroups = useGradebookColumnGroups();
   const [gradebookDataEpoch, setGradebookDataEpoch] = useState(0);
   useEffect(() => {
     return gradebookController.table.subscribeToData(() => {
@@ -2548,93 +2538,33 @@ export default function GradebookTable() {
     slug: col.slug,
     sort_order: col.sort_order,
     name: col.name,
-    max_score: col.max_score
+    max_score: col.max_score,
+    group_id: col.group_id
   }));
   columnsForGrouping.sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0));
   const cachedColumnsKey = JSON.stringify(columnsForGrouping);
-  // Group gradebook columns by slug prefix, with special handling for assignment sub-groups
-  const groupedColumns = useMemo(() => {
-    const groups: Record<string, { groupName: string; columns: typeof columnsForGrouping }> = {};
-    const columns = JSON.parse(cachedColumnsKey) as typeof columnsForGrouping;
+  const cachedGroupsKey = JSON.stringify(columnGroups.map((g) => ({ id: g.id, name: g.name })));
+  // Groups are stored rows (gradebook_column_groups); this only lays them out.
+  const groupedColumns = useMemo(
+    () =>
+      groupGradebookColumns(
+        JSON.parse(cachedColumnsKey) as typeof columnsForGrouping,
+        JSON.parse(cachedGroupsKey) as { id: number; name: string }[]
+      ),
+    [cachedColumnsKey, cachedGroupsKey]
+  );
+  const columnGroupKeys = useMemo(() => groupKeyByColumnId(groupedColumns), [groupedColumns]);
 
-    columns.sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0));
-
-    let currentGroupKey = "";
-    let currentGroupIndex = 0;
-    let lastSortOrder = -1;
-
-    columns.forEach((col) => {
-      const slugParts = col.slug.split("-");
-      let baseGroupName: string;
-
-      // Special handling for assignment columns
-      if (slugParts[0] === "assignment" && slugParts.length >= 3) {
-        // For assignment-assignment-*, assignment-lab-*, etc., use "assignment-{type}" as the base group
-        baseGroupName = `${slugParts[0]}-${slugParts[1]}`;
-      } else {
-        // For all other columns, use the first part as the base group
-        baseGroupName = slugParts[0] || "other";
-      }
-
-      // Check if this column is contiguous with the previous one
-      const currentSortOrder = col.sort_order ?? 0;
-      const isContiguous = lastSortOrder === -1 || currentSortOrder === lastSortOrder + 1;
-
-      // If not contiguous or different prefix, start a new group
-      if (!isContiguous || baseGroupName !== currentGroupKey) {
-        currentGroupKey = baseGroupName;
-        currentGroupIndex++;
-      }
-
-      const groupKey = `${baseGroupName}-${currentGroupIndex}`;
-
-      if (!groups[groupKey]) {
-        // Format group name for display
-        let displayName: string;
-        if (baseGroupName === "other") {
-          displayName = "Other";
-        } else if (baseGroupName.startsWith("assignment-")) {
-          // For assignment sub-groups, capitalize and format nicely
-          const subType = baseGroupName.split("-")[1];
-          displayName = `${subType.charAt(0).toUpperCase() + subType.slice(1)}`;
-        } else {
-          displayName = baseGroupName.charAt(0).toUpperCase() + baseGroupName.slice(1);
-        }
-
-        groups[groupKey] = {
-          groupName: displayName,
-          columns: []
-        };
-      }
-
-      groups[groupKey].columns.push(col);
-      lastSortOrder = currentSortOrder;
-    });
-
-    return groups;
-  }, [cachedColumnsKey]);
-
-  // Initialize all groups as collapsed by default, but preserve existing collapsed state
+  // A group starts collapsed the first time it appears; after that it keeps whatever state the
+  // user left it in. (Collapsing everything whenever nothing was collapsed also re-collapsed the
+  // whole table after "Expand all" as soon as any column changed, e.g. after a Move Left.)
+  const seenGroupNamesRef = useRef<Set<string>>(new Set());
   useEffect(() => {
     const allGroupKeys = Object.keys(groupedColumns).filter((key) => groupedColumns[key].columns.length > 1);
     const baseGroupNames = [...new Set(allGroupKeys.map((key) => groupedColumns[key].groupName))];
-    setCollapsedGroups((prev) => {
-      const newSet = new Set<string>();
-
-      // Preserve existing collapsed state for groups that still exist
-      baseGroupNames.forEach((baseGroupName) => {
-        if (prev.has(baseGroupName)) {
-          newSet.add(baseGroupName);
-        }
-      });
-
-      // If no groups were previously collapsed, collapse all by default
-      if (newSet.size === 0 && baseGroupNames.length > 0) {
-        baseGroupNames.forEach((baseGroupName) => newSet.add(baseGroupName));
-      }
-
-      return newSet;
-    });
+    const newGroupNames = new Set(baseGroupNames.filter((name) => !seenGroupNamesRef.current.has(name)));
+    seenGroupNamesRef.current = new Set(baseGroupNames);
+    setCollapsedGroups((prev) => new Set(baseGroupNames.filter((name) => prev.has(name) || newGroupNames.has(name))));
   }, [groupedColumns]);
 
   // Force recalculation helper
@@ -2796,9 +2726,8 @@ export default function GradebookTable() {
   /**
    * Build columns with header groups
    *
-   * Header groups are created from gradebook columns that share the same slug prefix
-   * (everything before the first hyphen). Groups are only created when multiple
-   * contiguous columns share the same prefix.
+   * Header groups come from gradebook_column_groups (see groupGradebookColumns). A group
+   * only gets a header when more than one of its columns is present.
    *
    * Header Group Behavior:
    * - When EXPANDED: The group header spans all child columns using colSpan,
@@ -3014,9 +2943,9 @@ export default function GradebookTable() {
         groupedColumns,
         collapsedGroups,
         findBestColumnToShow,
-        gradebookColumns
+        columnGroupKeys
       }),
-    [scrollableLeafColumns, groupedColumns, collapsedGroups, findBestColumnToShow, gradebookColumns]
+    [scrollableLeafColumns, groupedColumns, collapsedGroups, findBestColumnToShow, columnGroupKeys]
   );
 
   const fullGradeColumnIdsOrdered = useMemo(
@@ -3260,23 +3189,13 @@ export default function GradebookTable() {
     while (i < scrollableLeafColumns.length) {
       const leaf = scrollableLeafColumns[i];
       const columnId = Number(leaf.id.slice(6));
-      const column = gradebookColumns.find((c) => c.id === columnId);
-      if (!column) {
+      const groupKey = columnGroupKeys.get(columnId);
+      const group = groupKey ? groupedColumns[groupKey] : undefined;
+      if (!group || group.columns.length <= 1) {
         pos += getColWidth(leaf.id);
         i++;
         continue;
       }
-      const prefix = column.slug.split("-")[0];
-      const baseGroupName = prefix || "other";
-      const groupEntry = Object.entries(groupedColumns).find(
-        ([key, group]) => key.startsWith(baseGroupName) && group.columns.some((col) => col.id === columnId)
-      );
-      if (!groupEntry || groupEntry[1].columns.length <= 1) {
-        pos += getColWidth(leaf.id);
-        i++;
-        continue;
-      }
-      const group = groupEntry[1];
       const groupColumns = group.columns;
       const isFirstInGroup = groupColumns[0].id === columnId;
       const isCollapsed = collapsedGroups.has(group.groupName);
@@ -3306,35 +3225,23 @@ export default function GradebookTable() {
       }
     }
     return segments;
-  }, [scrollableLeafColumns, gradebookColumns, groupedColumns, collapsedGroups, findBestColumnToShow, getColWidth]);
+  }, [scrollableLeafColumns, columnGroupKeys, groupedColumns, collapsedGroups, findBestColumnToShow, getColWidth]);
 
   const filterHeader = useCallback(
     (header: Header<UserProfile, unknown>) => {
       if (header.column.id.startsWith("grade_")) {
         const columnId = Number(header.column.id.slice(6));
-        const column = gradebookColumns.find((col) => col.id === columnId);
+        const groupKey = columnGroupKeys.get(columnId);
+        const group = groupKey ? groupedColumns[groupKey] : undefined;
 
-        if (column) {
-          const prefix = column.slug.split("-")[0];
-          const baseGroupName = prefix || "other";
-
-          const groupEntry = Object.entries(groupedColumns).find(
-            ([key, group]) => key.startsWith(baseGroupName) && group.columns.some((col) => col.id === columnId)
-          );
-
-          if (groupEntry && groupEntry[1].columns.length > 1) {
-            const isCollapsed = collapsedGroups.has(groupEntry[1].groupName);
-
-            if (isCollapsed) {
-              const bestColumn = findBestColumnToShow(groupEntry[1].columns);
-              return columnId === bestColumn.id;
-            }
-          }
+        if (group && group.columns.length > 1 && collapsedGroups.has(group.groupName)) {
+          const bestColumn = findBestColumnToShow(group.columns);
+          return columnId === bestColumn.id;
         }
       }
       return true;
     },
-    [gradebookColumns, groupedColumns, collapsedGroups, findBestColumnToShow]
+    [columnGroupKeys, groupedColumns, collapsedGroups, findBestColumnToShow]
   );
 
   const renderVirtualRow = useCallback(

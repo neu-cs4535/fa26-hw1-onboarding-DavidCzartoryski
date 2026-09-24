@@ -4900,6 +4900,36 @@ export class DatabaseSeeder {
     if (config.columnGroupFixtures) {
       await this.createColumnGroupFixtures(class_id, students);
     }
+
+    // Column groups are rows (gradebook_column_groups), and the migration that introduced them
+    // backfilled every gradebook that existed at the time. A seeded class is created after the
+    // migrations replay, so run the same backfill over it: the seeded gradebook then looks like
+    // a course that was already there when the migration ran. The insert-time default group
+    // (gradebook_columns_inherit_group) has already grouped some columns as they were created,
+    // before renumberGradebookColumnsForGrouping moved them, so clear those first; the backfill
+    // only touches gradebooks with no groups.
+    const { data: gradebook, error: gradebookError } = await supabase
+      .from("gradebooks")
+      .select("id")
+      .eq("class_id", class_id)
+      .single();
+    if (gradebookError || !gradebook) {
+      throw new Error(`Failed to find gradebook for class ${class_id}: ${gradebookError?.message}`);
+    }
+    const { error: clearError } = await supabase
+      .from("gradebook_column_groups")
+      .delete()
+      .eq("gradebook_id", gradebook.id);
+    if (clearError) {
+      throw new Error(`Failed to clear column groups for class ${class_id}: ${clearError.message}`);
+    }
+    const { data: groupsCreated, error: backfillError } = await supabase.rpc("gradebook_column_groups_backfill", {
+      p_gradebook_id: gradebook.id
+    });
+    if (backfillError) {
+      throw new Error(`Failed to backfill column groups for class ${class_id}: ${backfillError.message}`);
+    }
+    console.log(`   ✓ Backfilled ${groupsCreated} column groups`);
   }
 
   // Helper method to create specification grading scheme columns

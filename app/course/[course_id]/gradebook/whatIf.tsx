@@ -4,6 +4,7 @@ import { useClassProfiles } from "@/hooks/useClassProfiles";
 import { useGradebookWhatIfFeatureEnabled } from "@/hooks/useCourseFeatures";
 import {
   useGradebookColumn,
+  useGradebookColumnGroups,
   useGradebookColumns,
   useGradebookColumnStudent,
   useGradebookController,
@@ -16,6 +17,7 @@ import {
   useGradebookWhatIf,
   useWhatIfGrade
 } from "@/hooks/useGradebookWhatIf";
+import { groupGradebookColumns } from "@/lib/gradebookColumnGroups";
 import { GradebookColumn } from "@/utils/supabase/DatabaseTypes";
 import {
   Accordion,
@@ -528,98 +530,24 @@ function CollapsedGroupColumn({
 
 export function WhatIf({ private_profile_id, whatIfEnabled }: { private_profile_id: string; whatIfEnabled: boolean }) {
   const columns = useGradebookColumns();
+  const columnGroups = useGradebookColumnGroups();
 
   // State for collapsible groups - use base group name as key for stability
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
 
-  // Sort columns by sort order
-  const sortedColumns = useMemo(() => {
-    const cols = [...columns];
-    cols.sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0));
-    return cols;
-  }, [columns]);
+  // Groups are stored rows; this only lays out the columns this student can see.
+  const groupedColumns = useMemo(() => groupGradebookColumns(columns, columnGroups), [columns, columnGroups]);
 
-  // Group gradebook columns by slug prefix, with special handling for assignment sub-groups
-  const groupedColumns = useMemo(() => {
-    const groups: Record<string, { groupName: string; columns: GradebookColumn[] }> = {};
-
-    let currentGroupKey = "";
-    let currentGroupIndex = 0;
-    let lastSortOrder = -1;
-
-    sortedColumns.forEach((col) => {
-      const slugParts = col.slug.split("-");
-      let baseGroupName: string;
-
-      // Special handling for assignment columns
-      if (slugParts[0] === "assignment" && slugParts.length >= 3) {
-        // For assignment-assignment-*, assignment-lab-*, etc., use "assignment-{type}" as the base group
-        baseGroupName = `${slugParts[0]}-${slugParts[1]}`;
-      } else {
-        // For all other columns, use the first part as the base group
-        baseGroupName = slugParts[0] || "other";
-      }
-
-      // Check if this column is contiguous with the previous one
-      const currentSortOrder = col.sort_order ?? 0;
-      const isContiguous = lastSortOrder === -1 || currentSortOrder === lastSortOrder + 1;
-
-      // If not contiguous or different prefix, start a new group
-      if (!isContiguous || baseGroupName !== currentGroupKey) {
-        currentGroupKey = baseGroupName;
-        currentGroupIndex++;
-      }
-
-      const groupKey = `${baseGroupName}-${currentGroupIndex}`;
-
-      if (!groups[groupKey]) {
-        // Format group name for display
-        let displayName: string;
-        if (baseGroupName === "other") {
-          displayName = "Other";
-        } else if (baseGroupName.startsWith("assignment-")) {
-          // For assignment sub-groups, capitalize and format nicely
-          const subType = baseGroupName.split("-")[1];
-          displayName = `${subType.charAt(0).toUpperCase() + subType.slice(1)}`;
-        } else {
-          displayName = baseGroupName.charAt(0).toUpperCase() + baseGroupName.slice(1);
-        }
-
-        groups[groupKey] = {
-          groupName: displayName,
-          columns: []
-        };
-      }
-
-      groups[groupKey].columns.push(col);
-      lastSortOrder = currentSortOrder;
-    });
-
-    return groups;
-  }, [sortedColumns]);
-
-  // Initialize all groups as collapsed by default, but preserve existing collapsed state
+  // A group starts collapsed the first time it appears; after that it keeps whatever state the
+  // user left it in. (Collapsing everything whenever nothing was collapsed also re-collapsed the
+  // whole table after "Expand all" as soon as any column changed, e.g. after a Move Left.)
+  const seenGroupNamesRef = useRef<Set<string>>(new Set());
   useEffect(() => {
     const allGroupKeys = Object.keys(groupedColumns).filter((key) => groupedColumns[key].columns.length > 1);
     const baseGroupNames = [...new Set(allGroupKeys.map((key) => groupedColumns[key].groupName))];
-
-    setCollapsedGroups((prev) => {
-      const newSet = new Set<string>();
-
-      // Preserve existing collapsed state for groups that still exist
-      baseGroupNames.forEach((baseGroupName) => {
-        if (prev.has(baseGroupName)) {
-          newSet.add(baseGroupName);
-        }
-      });
-
-      // If no groups were previously collapsed, collapse all by default
-      if (newSet.size === 0 && baseGroupNames.length > 0) {
-        baseGroupNames.forEach((baseGroupName) => newSet.add(baseGroupName));
-      }
-
-      return newSet;
-    });
+    const newGroupNames = new Set(baseGroupNames.filter((name) => !seenGroupNamesRef.current.has(name)));
+    seenGroupNamesRef.current = new Set(baseGroupNames);
+    setCollapsedGroups((prev) => new Set(baseGroupNames.filter((name) => prev.has(name) || newGroupNames.has(name))));
   }, [groupedColumns]);
 
   // Toggle group collapse/expand using base group name
