@@ -110,10 +110,17 @@ export type GradebookRecordsForStudent = {
 };
 export function useIsGradebookDataReady() {
   const gradebookController = useGradebookController();
-  const [isReady, setIsReady] = useState(gradebookController.table.ready);
+  // Groups are part of the layout: without them the first paint would draw every column
+  // ungrouped and then regroup.
+  const [isReady, setIsReady] = useState(
+    gradebookController.table.ready && gradebookController.gradebook_column_groups.ready
+  );
   useEffect(() => {
     let cleanedUp = false;
-    gradebookController.table.readyPromise.then(() => {
+    Promise.all([
+      gradebookController.table.readyPromise,
+      gradebookController.gradebook_column_groups.readyPromise
+    ]).then(() => {
       if (cleanedUp) return;
       setIsReady(true);
     });
@@ -420,6 +427,9 @@ export function useAreAllDependenciesReleased(columnId: number): boolean {
 }
 class StudentGradebookController {
   private _columnsForStudent: GradebookColumnStudent[] = [];
+  // gradebook_column_id -> the student's cell (the first one, as Array.find returned), so the
+  // per-cell lookups below are O(1) instead of a scan of every cell the student has.
+  private _columnsForStudentById: Map<number, GradebookColumnStudent> = new Map();
   private _profile_id: string;
   private _columnStudentSubscribers: Map<number, ((item: GradebookColumnStudent | undefined) => void)[]> = new Map();
   private _isInstructorOrGrader: boolean;
@@ -445,7 +455,7 @@ class StudentGradebookController {
       if (studentData) {
         this._updateColumnsForStudentFromNewFormat(studentData);
       } else {
-        this._columnsForStudent = [];
+        this._setColumnsForStudent([]);
         this._columnStudentSubscribers.forEach((subscribers) => {
           subscribers.forEach((cb) => cb(undefined));
         });
@@ -496,7 +506,7 @@ class StudentGradebookController {
       !this._arraysEqual(newColumns, this._columnsForStudent)
     ) {
       const prevByColId = new Map(this._columnsForStudent.map((c) => [c.gradebook_column_id, c]));
-      this._columnsForStudent = newColumns;
+      this._setColumnsForStudent(newColumns);
 
       // Notify only subscribers for columns that actually changed (avoids N-column fan-out per update)
       for (const col of newColumns) {
@@ -504,6 +514,16 @@ class StudentGradebookController {
         if (!prev || !this._columnStudentSnapshotEqual(prev, col)) {
           this._columnStudentSubscribers.get(col.gradebook_column_id)?.forEach((cb) => cb(col));
         }
+      }
+    }
+  }
+
+  private _setColumnsForStudent(columns: GradebookColumnStudent[]) {
+    this._columnsForStudent = columns;
+    this._columnsForStudentById = new Map();
+    for (const column of columns) {
+      if (!this._columnsForStudentById.has(column.gradebook_column_id)) {
+        this._columnsForStudentById.set(column.gradebook_column_id, column);
       }
     }
   }
@@ -542,10 +562,14 @@ class StudentGradebookController {
     } else {
       this._columnsForStudent[index] = updatedColumn;
     }
+    const indexed = this._columnsForStudentById.get(updatedColumn.gradebook_column_id);
+    if (!indexed || indexed.id === updatedColumn.id) {
+      this._columnsForStudentById.set(updatedColumn.gradebook_column_id, updatedColumn);
+    }
     this._columnStudentSubscribers.get(updatedColumn.gradebook_column_id)?.forEach((cb) => cb(updatedColumn));
   }
   getColumnForStudent(column_id: number, cb?: (item: GradebookColumnStudent | undefined) => void) {
-    const item = this._columnsForStudent.find((s) => s.gradebook_column_id === column_id);
+    const item = this._columnsForStudentById.get(column_id);
     if (cb) {
       const unsubscribe = this.subscribeColumnStudent(column_id, cb);
       return {
@@ -572,11 +596,11 @@ class StudentGradebookController {
   }
 
   public getGradesForStudent(column_id: number) {
-    return this._columnsForStudent.find((s) => s.gradebook_column_id === column_id);
+    return this._columnsForStudentById.get(column_id);
   }
 
   public filter(column_id: number, filterValue: string) {
-    const item = this._columnsForStudent.find((s) => s.gradebook_column_id === column_id);
+    const item = this._columnsForStudentById.get(column_id);
     if (!item) return false;
     return String(item.score_override ?? item.score ?? "") === filterValue;
   }
@@ -1960,7 +1984,13 @@ export class GradebookController {
 
   // Removed get gradebook() method - use new GradebookCellController data directly instead
   get isReady() {
-    return this.gradebook_row.ready && this.gradebook_columns.ready && this.table.ready && this.assignments_table.ready;
+    return (
+      this.gradebook_row.ready &&
+      this.gradebook_columns.ready &&
+      this.gradebook_column_groups.ready &&
+      this.table.ready &&
+      this.assignments_table.ready
+    );
   }
 
   get isAnyTableRefetching() {

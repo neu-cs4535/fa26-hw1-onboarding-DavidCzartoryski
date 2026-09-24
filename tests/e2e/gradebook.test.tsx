@@ -1755,6 +1755,8 @@ test.describe("Gradebook column group management", () => {
 
   let groupsCourse: Course;
   let groupsInstructor: TestingUser;
+  let groupsStudent: TestingUser;
+  let groupsGrader: TestingUser;
 
   test.beforeAll(async () => {
     const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -1773,9 +1775,18 @@ test.describe("Gradebook column group management", () => {
         role: "instructor",
         class_id: groupsCourse.id,
         useMagicLink: true
+      },
+      {
+        name: "Groups Grader",
+        email: `groups-grader-${id}@pawtograder.net`,
+        role: "grader",
+        class_id: groupsCourse.id,
+        useMagicLink: true
       }
     ]);
+    groupsStudent = users[0];
     groupsInstructor = users[1];
+    groupsGrader = users[2];
     await createAssignmentsAndGradebookColumns({
       class_id: groupsCourse.id,
       numAssignments: 4,
@@ -1898,5 +1909,40 @@ test.describe("Gradebook column group management", () => {
       .select("name")
       .eq("class_id", groupsCourse.id);
     expect((remaining ?? []).map((g) => g.name)).toEqual(["Test Assignment"]);
+  });
+
+  test("a grader sees the groups but gets no controls for changing them", async ({ page }) => {
+    await loginAsUser(page, groupsGrader, groupsCourse);
+    // The course nav links the instructor gradebook for instructors only, but the page itself is
+    // reachable, so check what a grader who opens it can do.
+    await page.goto(`/course/${groupsCourse.id}/manage/gradebook`);
+    await page.waitForLoadState("networkidle");
+    await waitForVirtualizerIdle(page);
+    const region = page.getByRole("region", { name: "Instructor Gradebook Table" });
+    await expect(region.getByRole("button", { name: /^Test Assignment · \d+$/ })).toBeVisible();
+    await expect(region.getByRole("button", { name: /^Group options for / })).toHaveCount(0);
+    await region.getByRole("button", { name: "Expand all groups" }).click();
+    // Graders get plain column headers (the draggable ones, with data-col-id, are instructor-only).
+    await region
+      .getByRole("columnheader")
+      .filter({ hasText: "Test Assignment 4" })
+      .getByRole("button", { name: "Column options" })
+      .click();
+    await expect(page.getByRole("menuitem", { name: "Edit Column" })).toBeVisible();
+    await expect(page.getByRole("menuitem", { name: "Group…" })).toHaveCount(0);
+  });
+
+  test("a student sees stored groups in the what-if view, and the header toggles from the keyboard", async ({
+    page
+  }) => {
+    await loginAsUser(page, groupsStudent, groupsCourse);
+    await page.goto(`/course/${groupsCourse.id}/gradebook`);
+    await expect(page.getByRole("region", { name: "Student Gradebook" })).toBeVisible();
+    const header = page.getByRole("button", { name: /^Test Assignment · \d+$/ });
+    await expect(header).toBeVisible();
+    await expect(header).toHaveAttribute("aria-expanded", "false");
+    await header.focus();
+    await page.keyboard.press("Enter");
+    await expect(header).toHaveAttribute("aria-expanded", "true");
   });
 });

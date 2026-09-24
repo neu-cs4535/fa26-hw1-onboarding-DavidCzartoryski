@@ -1,24 +1,27 @@
--- Rollback for supabase/migrations/20260924033840_gradebook_column_groups.sql and
--- 20260924045931_gradebook_column_groups_crud.sql, undone together, newest first.
+-- Rollback for the column-groups migrations, newest first:
+--   20260924063440_drop_duplicate_gradebook_columns_slug_index
+--   20260924045931_gradebook_column_groups_crud
+--   20260924033840_gradebook_column_groups
 --
 -- Supabase migrations only run forward, so this is not picked up by `db reset` or `db push`.
--- To undo the change on a database the migration has already run on:
+-- To undo the change on a database the migrations have already run on:
 --
 --   1. Roll the web app back first. The previous frontend never reads group_id or
 --      gradebook_column_groups, so it runs unchanged against the migrated schema; the reverse
 --      is not true, because this frontend breaks without the table.
---   2. Run this file with psql as the database owner, in one transaction.
+--   2. Run this file with psql as the database owner. It is one transaction.
 --   3. Ship the undo in the repo as a new forward migration with this body, so staging and
---      fresh installs stop replaying the original.
+--      fresh installs stop replaying the originals.
 --
--- It archives before it drops: any group an instructor created or renamed since the migration
--- ran is kept in rollback_archive, a schema PostgREST does not expose (config.toml lists
--- public, graphql_public, pgmq_public), so re-applying later can restore edits instead of
+-- It archives before it drops: every group and its member columns are kept in
+-- rollback_archive, a schema PostgREST does not expose (config.toml lists public,
+-- graphql_public, pgmq_public), so re-applying later can restore instructors' edits instead of
 -- re-deriving them from slugs.
 --
--- Nothing else is lost: columns keep their sort_order (the current left-to-right order), and
--- the four functions the migrations replaced (reorder, auto-layout, Move Left, Move Right) go
--- back to their previous bodies, identical apart from the punctuation of one comment.
+-- Nothing else is lost: columns keep their sort_order (their current left-to-right order), and
+-- the five functions the migrations replaced (reorder, auto-layout, Move Left, Move Right, and
+-- the row-level column broadcast) go back to their previous bodies, identical apart from the
+-- punctuation of one comment.
 
 BEGIN;
 
@@ -38,10 +41,16 @@ FROM public.gradebook_column_groups g
 LEFT JOIN public.gradebook_columns gc ON gc.group_id = g.id
 GROUP BY g.id;
 
--- 20260924045931_gradebook_column_groups_crud
+-- ---------------------------------------------------------------------------------------------
+-- 20260924063440_drop_duplicate_gradebook_columns_slug_index
+-- ---------------------------------------------------------------------------------------------
 
-DROP TRIGGER gradebook_columns_drop_empty_group_tr ON public.gradebook_columns;
-DROP FUNCTION public.gradebook_column_groups_drop_empty();
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gradebook_columns_unique_class_slug
+  ON public.gradebook_columns (class_id, slug);
+
+-- ---------------------------------------------------------------------------------------------
+-- 20260924045931_gradebook_column_groups_crud
+-- ---------------------------------------------------------------------------------------------
 
 -- Previous bodies of Move Left / Move Right.
 CREATE OR REPLACE FUNCTION public.gradebook_column_move_left(p_column_id bigint)
@@ -255,22 +264,24 @@ $function$
 
 ;
 
-
-DROP FUNCTION public.gradebook_column_group_create(bigint, text, bigint[]);
-DROP FUNCTION public.gradebook_column_set_group(bigint, bigint);
-DROP FUNCTION public.gradebook_column_group_move(bigint, integer);
 DROP FUNCTION public.gradebook_column_step(bigint, integer);
+DROP FUNCTION public.gradebook_column_group_move(bigint, integer);
 DROP FUNCTION public.gradebook_columns_swap_unit(bigint, text, integer);
-DROP FUNCTION public.gradebook_columns_apply_order(bigint, bigint[]);
+DROP FUNCTION public.gradebook_column_set_group(bigint, bigint);
+DROP FUNCTION public.gradebook_column_group_create(bigint, text, bigint[]);
+DROP FUNCTION public.gradebook_column_groups_check_direction(integer);
 DROP FUNCTION public.gradebook_column_groups_authorize(bigint);
-DROP FUNCTION public.gradebook_columns_display_order(bigint);
 
+-- ---------------------------------------------------------------------------------------------
 -- 20260924033840_gradebook_column_groups
+-- ---------------------------------------------------------------------------------------------
 
 DROP TRIGGER gradebook_columns_inherit_group_tr ON public.gradebook_columns;
-DROP FUNCTION public.gradebook_columns_inherit_group();
+DROP TRIGGER gradebook_columns_repair_groups_insert_tr ON public.gradebook_columns;
+DROP TRIGGER gradebook_columns_repair_groups_update_tr ON public.gradebook_columns;
+DROP TRIGGER gradebook_columns_drop_empty_group_tr ON public.gradebook_columns;
 
--- Previous bodies of the two functions the migration replaced.
+-- Previous bodies of gradebook_columns_reorder and gradebook_auto_layout.
 CREATE OR REPLACE FUNCTION public.gradebook_columns_reorder(p_ordered_column_ids bigint[])
  RETURNS void
  LANGUAGE plpgsql
@@ -531,20 +542,116 @@ $function$
 
 ;
 
-DROP FUNCTION public.gradebook_columns_make_groups_contiguous(bigint);
+-- Previous body of the row-level column broadcast.
+CREATE OR REPLACE FUNCTION public.broadcast_gradebook_columns_change()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+DECLARE
+    target_class_id BIGINT;
+    staff_payload JSONB;
+    user_payload JSONB;
+    affected_profile_ids UUID[];
+    profile_id UUID;
+BEGIN
+    -- Get the class_id from the record
+    IF TG_OP = 'INSERT' THEN
+        target_class_id := NEW.class_id;
+    ELSIF TG_OP = 'UPDATE' THEN
+        target_class_id := COALESCE(NEW.class_id, OLD.class_id);
+    ELSIF TG_OP = 'DELETE' THEN
+        target_class_id := OLD.class_id;
+    END IF;
+
+    IF target_class_id IS NOT NULL THEN
+        -- Create payload for gradebook_columns changes
+        staff_payload := jsonb_build_object(
+            'type', 'table_change',
+            'operation', TG_OP,
+            'table', TG_TABLE_NAME,
+            'row_id', CASE
+                WHEN TG_OP = 'DELETE' THEN OLD.id
+                ELSE NEW.id
+            END,
+            'data', CASE
+                WHEN TG_OP = 'DELETE' THEN to_jsonb(OLD)
+                ELSE to_jsonb(NEW)
+            END,
+            'class_id', target_class_id,
+            'target_audience', 'staff',
+            'timestamp', NOW()
+        );
+
+        -- Broadcast to staff channel (instructors and graders see all column changes)
+        PERFORM public.safe_broadcast(
+            staff_payload,
+            'broadcast',
+            'class:' || target_class_id || ':staff',
+            true
+        );
+
+        -- Get all students in the class for user channels
+        SELECT ARRAY(
+            SELECT ur.private_profile_id
+            FROM public.user_roles ur
+            WHERE ur.class_id = target_class_id AND ur.role = 'student'
+        ) INTO affected_profile_ids;
+
+        -- Create user payload (same as staff but marked for users)
+        user_payload := staff_payload || jsonb_build_object('target_audience', 'user');
+
+        -- Broadcast to all student user channels (students see column structure changes)
+        FOREACH profile_id IN ARRAY affected_profile_ids
+        LOOP
+            PERFORM public.safe_broadcast(
+                user_payload,
+                'broadcast',
+                'class:' || target_class_id || ':user:' || profile_id,
+                true
+            );
+        END LOOP;
+    END IF;
+
+    -- Return the appropriate record
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    ELSE
+        RETURN NEW;
+    END IF;
+END;
+$function$
+
+;
+
 DROP FUNCTION public.gradebook_column_groups_backfill(bigint);
+DROP FUNCTION public.gradebook_columns_inherit_group();
+DROP FUNCTION public.gradebook_columns_repair_group_order();
+DROP FUNCTION public.gradebook_columns_apply_order(bigint, bigint[]);
+DROP FUNCTION public.gradebook_columns_make_groups_contiguous(bigint);
+DROP FUNCTION public.gradebook_columns_write_order(bigint, bigint[]);
+DROP FUNCTION public.gradebook_columns_broadcast_order(bigint, bigint[]);
+DROP FUNCTION public.gradebook_columns_order_payload(bigint, bigint[], text);
+DROP FUNCTION public.gradebook_column_groups_torn(bigint);
+DROP FUNCTION public.gradebook_columns_display_order(bigint);
+DROP FUNCTION public.gradebook_column_group_free_name(bigint, text);
+DROP FUNCTION public.gradebook_column_dependency_ids(jsonb);
 DROP FUNCTION public.gradebook_column_family_title(text);
 DROP FUNCTION public.gradebook_column_name_stem(text);
 DROP FUNCTION public.gradebook_column_family(text);
+DROP FUNCTION public.gradebook_column_group_clean_name(text);
+DROP FUNCTION public.gradebook_column_groups_drop_empty();
 
--- Dropping a column is DDL and fires no row triggers, so unlike the backfill this sends no
--- realtime traffic.
 -- The table goes before the column: its "everyone in class can view" policy reads
--- gradebook_columns.group_id, and the foreign key goes before the table.
+-- gradebook_columns.group_id, and the foreign key goes before the table. Dropping the table
+-- also drops its own triggers and policies.
 ALTER TABLE public.gradebook_columns DROP CONSTRAINT gradebook_columns_group_fkey;
 DROP TABLE public.gradebook_column_groups;
 DROP FUNCTION public.broadcast_gradebook_column_groups_change();
+DROP FUNCTION public.gradebook_column_groups_require_member();
 
+-- Dropping a column is DDL and fires no row triggers, so this sends no realtime traffic.
 DROP INDEX public.gradebook_columns_group_id_idx;
 ALTER TABLE public.gradebook_columns DROP COLUMN group_id;
 

@@ -7,9 +7,11 @@
  * as a group of one, which the gradebook renders without a header. A stored group always gets a
  * header, even with one member: an instructor made it, so it should be visible and editable.
  *
- * The database keeps each group's members adjacent in `sort_order` (see
- * `gradebook_columns_make_groups_contiguous`), so anchoring at the first member only changes
- * anything when that invariant is momentarily broken, e.g. between a reorder and its refetch.
+ * The order matches `gradebook_columns_display_order` in the database exactly: columns sorted by
+ * (sort_order, id) with a NULL sort_order as 0, and each group drawn whole at its first column.
+ * The database keeps each group's members adjacent in `sort_order`, so anchoring at the first
+ * member only changes anything when that invariant is momentarily broken, e.g. between a
+ * reorder and its refetch.
  */
 
 export type GradebookColumnGroupRow = { id: number; name: string };
@@ -65,4 +67,97 @@ export function groupKeyByColumnId<C extends { id: number }>(grouping: Gradebook
     for (const col of group.columns) map.set(col.id, key);
   }
   return map;
+}
+
+/**
+ * The column a collapsed group shows: its last column with any score (the newest graded work),
+ * or its last column if none has a score yet.
+ */
+export function pickCollapsedGroupColumnId(
+  columns: readonly { id: number }[],
+  hasScore: (columnId: number) => boolean
+): number | undefined {
+  for (let i = columns.length - 1; i >= 0; i--) {
+    if (hasScore(columns[i].id)) return columns[i].id;
+  }
+  return columns[columns.length - 1]?.id;
+}
+
+/**
+ * Which drop gaps a dragged column may use without changing any group's membership. Gap `i` is
+ * the boundary before unit `i` (gap `units.length` is after the last one).
+ *
+ * `unitGroupKeys[i]` is the group key of unit `i` when it is one column of an expanded group, and
+ * null for an ungrouped column or a collapsed group (which moves as one unit).
+ * `draggedGroupKey` is the expanded group the dragged column belongs to, or null.
+ *
+ * A member of an expanded group can be dropped anywhere inside its group, edges included; any
+ * other unit can be dropped anywhere except strictly inside an expanded group.
+ */
+export function validDropGaps(unitGroupKeys: readonly (string | null)[], draggedGroupKey: string | null): boolean[] {
+  const n = unitGroupKeys.length;
+  return Array.from({ length: n + 1 }, (_, gap) => {
+    const left = gap > 0 ? unitGroupKeys[gap - 1] : null;
+    const right = gap < n ? unitGroupKeys[gap] : null;
+    if (draggedGroupKey !== null) return left === draggedGroupKey || right === draggedGroupKey;
+    return !(left !== null && left === right);
+  });
+}
+
+/**
+ * A column's display name without a trailing "(...)" or number: "Lab 1 (Group)" -> "Lab",
+ * "Skill #12" -> "Skill". Mirrors `gradebook_column_name_stem` in the database; used to suggest a
+ * name for a new group.
+ */
+export function columnNameStem(name: string): string {
+  return name
+    .replace(/\s*\([^)]*\)\s*$/, "")
+    .replace(/\s*#?\s*\d+\s*$/, "")
+    .trim();
+}
+
+type SuggestableColumn = GroupableGradebookColumn & { dependencies?: unknown };
+
+/** The column ids a computed column reads (`dependencies.gradebook_columns`), sorted, or null. */
+export function dependencyKey(dependencies: unknown): string | null {
+  if (!dependencies || typeof dependencies !== "object") return null;
+  const ids = (dependencies as { gradebook_columns?: unknown }).gradebook_columns;
+  if (!Array.isArray(ids)) return null;
+  const numbers = ids.filter((id): id is number => typeof id === "number" && Number.isInteger(id));
+  if (numbers.length === 0) return null;
+  return [...new Set(numbers)].sort((a, b) => a - b).join(",");
+}
+
+/**
+ * Groups worth offering first when moving `column` into a group, best first:
+ *   1. groups with a column computed from exactly the same inputs (another tally of the same
+ *      skills belongs with the others, even when a column sits between them);
+ *   2. the groups of the columns right before and after it.
+ * Never includes the column's own group.
+ */
+export function suggestColumnGroups(
+  column: SuggestableColumn,
+  columns: readonly SuggestableColumn[],
+  groups: readonly GradebookColumnGroupRow[]
+): number[] {
+  const groupIds = new Set(groups.map((g) => g.id));
+  const suggestions: number[] = [];
+  const add = (groupId: number | null | undefined) => {
+    if (groupId == null || groupId === column.group_id || !groupIds.has(groupId)) return;
+    if (!suggestions.includes(groupId)) suggestions.push(groupId);
+  };
+
+  const key = dependencyKey(column.dependencies);
+  if (key !== null) {
+    for (const other of columns) {
+      if (other.id !== column.id && dependencyKey(other.dependencies) === key) add(other.group_id);
+    }
+  }
+
+  const ordered = Object.values(groupGradebookColumns(columns, groups)).flatMap((g) => g.columns);
+  const index = ordered.findIndex((c) => c.id === column.id);
+  if (index > 0) add(ordered[index - 1].group_id);
+  if (index >= 0 && index < ordered.length - 1) add(ordered[index + 1].group_id);
+
+  return suggestions;
 }

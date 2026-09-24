@@ -5,9 +5,14 @@
  */
 import {
   columnGroupIdFromKey,
+  columnNameStem,
+  dependencyKey,
   groupGradebookColumns,
   groupKeyByColumnId,
-  isColumnGroupKey
+  isColumnGroupKey,
+  pickCollapsedGroupColumnId,
+  suggestColumnGroups,
+  validDropGaps
 } from "@/lib/gradebookColumnGroups";
 
 type Col = { id: number; name: string; slug: string; sort_order: number | null; group_id: number | null };
@@ -100,5 +105,103 @@ describe("groupGradebookColumns", () => {
       [1, "group-1"],
       [2, "column-2"]
     ]);
+  });
+});
+
+describe("ordering matches gradebook_columns_display_order", () => {
+  const groups = [{ id: 1, name: "Exam" }];
+
+  it("does not interleave a group with an ungrouped column that ties with its first column", () => {
+    // exam-1 (id 31) and attendance (id 39) share sort_order 8: the group is drawn whole first.
+    const columns = [col(31, 8, 1), col(39, 8, null), col(32, 9, 1), col(33, 10, 1)];
+    expect(shape(groupGradebookColumns(columns, groups))).toEqual([
+      ["group-1", "Exam", [31, 32, 33]],
+      ["column-39", "Column 39", [39]]
+    ]);
+  });
+
+  it("treats a NULL sort_order as 0 and breaks the tie by id", () => {
+    const columns = [col(5, 1, null), col(7, null, 1), col(3, 0, 1)];
+    expect(shape(groupGradebookColumns(columns, groups))).toEqual([
+      ["group-1", "Exam", [3, 7]],
+      ["column-5", "Column 5", [5]]
+    ]);
+  });
+});
+
+describe("pickCollapsedGroupColumnId", () => {
+  const cols = [{ id: 1 }, { id: 2 }, { id: 3 }];
+  it("picks the last column with a score", () => {
+    expect(pickCollapsedGroupColumnId(cols, (id) => id <= 2)).toBe(2);
+  });
+  it("falls back to the last column when nothing is scored", () => {
+    expect(pickCollapsedGroupColumnId(cols, () => false)).toBe(3);
+  });
+  it("returns undefined for an empty group", () => {
+    expect(pickCollapsedGroupColumnId([], () => true)).toBeUndefined();
+  });
+});
+
+describe("validDropGaps", () => {
+  // Units: ungrouped A, expanded group g (two columns), collapsed group (one unit), ungrouped B.
+  const units = [null, "group-1", "group-1", null, null];
+
+  it("keeps a member of an expanded group inside it, edges included", () => {
+    expect(validDropGaps(units, "group-1")).toEqual([false, true, true, true, false, false]);
+  });
+  it("keeps everything else out of the inside of an expanded group", () => {
+    expect(validDropGaps(units, null)).toEqual([true, true, false, true, true, true]);
+  });
+  it("allows the boundary between two expanded groups", () => {
+    expect(validDropGaps(["group-1", "group-2"], null)).toEqual([true, true, true]);
+  });
+});
+
+describe("columnNameStem", () => {
+  it.each([
+    ["Lab 1 (Group)", "Lab"],
+    ["Skill #12", "Skill"],
+    ["AI Usage Log 2", "AI Usage Log"],
+    ["Quiz (2) 1", "Quiz (2)"],
+    ["Participation", "Participation"]
+  ])("%s -> %s", (name, stem) => {
+    expect(columnNameStem(name)).toBe(stem);
+  });
+});
+
+describe("dependencyKey", () => {
+  it("normalizes a gradebook_columns dependency list", () => {
+    expect(dependencyKey({ gradebook_columns: [3, 1, 3, 2] })).toBe("1,2,3");
+  });
+  it("ignores anything that is not a column id", () => {
+    expect(dependencyKey({ gradebook_columns: ["x", 1.5, null, 4] })).toBe("4");
+    expect(dependencyKey({ assignments: [1] })).toBeNull();
+    expect(dependencyKey(null)).toBeNull();
+  });
+});
+
+describe("suggestColumnGroups", () => {
+  const groups = [
+    { id: 1, name: "Skill" },
+    { id: 2, name: "Skill summary" },
+    { id: 3, name: "Quiz" }
+  ];
+  const skills = { gradebook_columns: [10, 11] };
+  const columns = [
+    { ...col(10, 0, 1), dependencies: null },
+    { ...col(11, 1, 1), dependencies: null },
+    { ...col(20, 2, 2), dependencies: skills },
+    { ...col(21, 3, 2), dependencies: skills },
+    { ...col(30, 4, null), dependencies: null },
+    { ...col(40, 5, null), dependencies: skills },
+    { ...col(50, 6, 3), dependencies: null }
+  ];
+
+  it("offers the group computed from the same inputs first, then the neighbors' groups", () => {
+    // Column 40 tallies the same skills as the Skill summary, with column 30 in between.
+    expect(suggestColumnGroups(columns[5], columns, groups)).toEqual([2, 3]);
+  });
+  it("never offers the column's own group", () => {
+    expect(suggestColumnGroups(columns[2], columns, groups)).toEqual([1]);
   });
 });

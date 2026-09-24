@@ -3588,6 +3588,7 @@ export type Database = {
           gradebook_id: number;
           id: number;
           name: string;
+          updated_at: string;
         };
         Insert: {
           class_id: number;
@@ -3595,6 +3596,7 @@ export type Database = {
           gradebook_id: number;
           id?: number;
           name: string;
+          updated_at?: string;
         };
         Update: {
           class_id?: number;
@@ -3602,6 +3604,7 @@ export type Database = {
           gradebook_id?: number;
           id?: number;
           name?: string;
+          updated_at?: string;
         };
         Relationships: [
           {
@@ -13448,14 +13451,26 @@ export type Database = {
         Args: { p_gradebook_id: number };
         Returns: undefined;
       };
+      gradebook_column_dependency_ids: {
+        Args: { p_dependencies: Json };
+        Returns: number[];
+      };
       gradebook_column_family: { Args: { p_slug: string }; Returns: string };
       gradebook_column_family_title: {
         Args: { p_family: string };
         Returns: string;
       };
+      gradebook_column_group_clean_name: {
+        Args: { p_name: string };
+        Returns: string;
+      };
       gradebook_column_group_create: {
         Args: { p_column_ids: number[]; p_gradebook_id: number; p_name: string };
         Returns: number;
+      };
+      gradebook_column_group_free_name: {
+        Args: { p_gradebook_id: number; p_name: string };
+        Returns: string;
       };
       gradebook_column_group_move: {
         Args: { p_direction: number; p_group_id: number };
@@ -13468,6 +13483,14 @@ export type Database = {
       gradebook_column_groups_backfill: {
         Args: { p_gradebook_id?: number };
         Returns: number;
+      };
+      gradebook_column_groups_check_direction: {
+        Args: { p_direction: number };
+        Returns: undefined;
+      };
+      gradebook_column_groups_torn: {
+        Args: { p_gradebook_id: number };
+        Returns: boolean;
       };
       gradebook_column_move_left: {
         Args: { p_column_id: number };
@@ -13542,6 +13565,10 @@ export type Database = {
         Args: { p_gradebook_id: number; p_ordered_ids: number[] };
         Returns: undefined;
       };
+      gradebook_columns_broadcast_order: {
+        Args: { p_column_ids: number[]; p_gradebook_id: number };
+        Returns: undefined;
+      };
       gradebook_columns_display_order: {
         Args: { p_gradebook_id: number };
         Returns: {
@@ -13553,7 +13580,11 @@ export type Database = {
       };
       gradebook_columns_make_groups_contiguous: {
         Args: { p_gradebook_id: number };
-        Returns: undefined;
+        Returns: number[];
+      };
+      gradebook_columns_order_payload: {
+        Args: { p_audience: string; p_class_id: number; p_column_ids: number[] };
+        Returns: Json;
       };
       gradebook_columns_reorder: {
         Args: { p_ordered_column_ids: number[] };
@@ -13562,6 +13593,10 @@ export type Database = {
       gradebook_columns_swap_unit: {
         Args: { p_direction: number; p_gradebook_id: number; p_unit: string };
         Returns: boolean;
+      };
+      gradebook_columns_write_order: {
+        Args: { p_gradebook_id: number; p_ordered_ids: number[] };
+        Returns: number[];
       };
       help_request_is_private: {
         Args: { p_help_request_id: number };

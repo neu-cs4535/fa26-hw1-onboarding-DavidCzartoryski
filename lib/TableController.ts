@@ -55,6 +55,7 @@ const TABLES_WITH_UPDATED_AT = new Set<TablesThatHaveAnIDField>([
   "discussion_thread_read_status",
   "discussion_thread_watchers",
   "discussion_threads",
+  "gradebook_column_groups",
   "gradebook_column_students",
   "gradebook_columns",
   "help_queue_assignments",
@@ -1450,6 +1451,31 @@ export default class TableController<
     }
     this._lastRefetchAllTime = Date.now();
 
+    await this._refetchAllData();
+  }
+
+  /**
+   * Fetch what changed after a write this client just made, without the rate limit that makes
+   * `refetchAll()` throw when two edits land within 3 seconds.
+   *
+   * With an `updated_at` watermark this is `catchUpSinceWatermark()`: only rows changed since
+   * the last fetch. Without one (a table this controller has seen no rows of yet, or a table
+   * with no `updated_at`), it runs a full refetch, unless one ran in the last 3 seconds, in
+   * which case realtime already carries the change and it returns. Deletions are not visible
+   * to a watermark query; they arrive by realtime, or use `hardDelete` for your own.
+   */
+  async refreshChanges(): Promise<void> {
+    if (this._closed) return;
+    if (this._maxUpdatedAtMs != null && this._shouldEnableAutoRefetch()) {
+      await this.catchUpSinceWatermark();
+      return;
+    }
+    if (this._isRefetching) {
+      await this.waitForRefetchToComplete();
+      return;
+    }
+    if (Date.now() - this._lastRefetchAllTime < 3000) return;
+    this._lastRefetchAllTime = Date.now();
     await this._refetchAllData();
   }
 

@@ -17,6 +17,7 @@ import {
   useGradebookWhatIf,
   useWhatIfGrade
 } from "@/hooks/useGradebookWhatIf";
+import { useColumnGroupCollapse } from "@/hooks/useColumnGroupCollapse";
 import { groupGradebookColumns, isColumnGroupKey } from "@/lib/gradebookColumnGroups";
 import { GradebookColumn } from "@/utils/supabase/DatabaseTypes";
 import {
@@ -37,9 +38,8 @@ import {
 } from "@chakra-ui/react";
 
 import { Alert } from "@/components/ui/alert";
-import pluralize from "pluralize";
 import type { CSSProperties, MouseEvent } from "react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 
 // Module-stable style — `<Markdown>` is `memo`-wrapped (see
 // `components/ui/markdown.tsx`); inline literals defeat it.
@@ -472,8 +472,13 @@ function GroupHeader({
         <HStack as="span" justifyContent="space-between" alignItems="center">
           <HStack as="span" gap={2}>
             <Icon as={isCollapsed ? LuChevronRight : LuChevronDown} boxSize={4} color="fg.muted" aria-hidden="true" />
+            {/* The group's own name as the instructor wrote it, and how many columns it has. */}
             <Text as="span" fontWeight="bold" fontSize="sm" color="fg.muted">
-              {columnCount} {pluralize(groupName.charAt(0).toUpperCase() + groupName.slice(1), columnCount)}...
+              {groupName}
+              <Text as="span" fontWeight="normal">
+                {" "}
+                · {columnCount}
+              </Text>
             </Text>
           </HStack>
         </HStack>
@@ -532,48 +537,17 @@ export function WhatIf({ private_profile_id, whatIfEnabled }: { private_profile_
   const columns = useGradebookColumns();
   const columnGroups = useGradebookColumnGroups();
 
-  // State for collapsible groups - use base group name as key for stability
-  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
+  const gradebookController = useGradebookController();
 
   // Groups are stored rows; this only lays out the columns this student can see.
   const groupedColumns = useMemo(() => groupGradebookColumns(columns, columnGroups), [columns, columnGroups]);
+  const storedGroupKeys = useMemo(() => Object.keys(groupedColumns).filter(isColumnGroupKey), [groupedColumns]);
 
-  // A group starts collapsed the first time it appears; after that it keeps whatever state the
-  // user left it in. (Collapsing everything whenever nothing was collapsed also re-collapsed the
-  // whole table after "Expand all" as soon as any column changed, e.g. after a Move Left.)
-  const seenGroupNamesRef = useRef<Set<string>>(new Set());
-  useEffect(() => {
-    const allGroupKeys = Object.keys(groupedColumns).filter(isColumnGroupKey);
-    const baseGroupNames = [...new Set(allGroupKeys.map((key) => groupedColumns[key].groupName))];
-    const newGroupNames = new Set(baseGroupNames.filter((name) => !seenGroupNamesRef.current.has(name)));
-    seenGroupNamesRef.current = new Set(baseGroupNames);
-    setCollapsedGroups((prev) => new Set(baseGroupNames.filter((name) => prev.has(name) || newGroupNames.has(name))));
-  }, [groupedColumns]);
-
-  // Toggle group collapse/expand using base group name
-  const toggleGroup = useCallback((baseGroupName: string) => {
-    setCollapsedGroups((prev) => {
-      const newSet = new Set(prev);
-      if (newSet.has(baseGroupName)) {
-        newSet.delete(baseGroupName);
-      } else {
-        newSet.add(baseGroupName);
-      }
-      return newSet;
-    });
-  }, []);
-
-  // Expand all groups
-  const expandAll = useCallback(() => {
-    setCollapsedGroups(new Set());
-  }, []);
-
-  // Collapse all groups
-  const collapseAll = useCallback(() => {
-    const allGroupKeys = Object.keys(groupedColumns).filter(isColumnGroupKey);
-    const baseGroupNames = [...new Set(allGroupKeys.map((key) => groupedColumns[key].groupName))];
-    setCollapsedGroups(new Set(baseGroupNames));
-  }, [groupedColumns]);
+  // Keyed by group key, so a rename keeps a group's state, and remembered across reloads.
+  const { collapsedGroups, toggleGroup, expandAll, collapseAll } = useColumnGroupCollapse(
+    storedGroupKeys,
+    `pawtograder:whatif-collapsed-groups:${gradebookController.gradebook_id}:${private_profile_id}`
+  );
 
   // Build the rendered items
   const renderedItems = useMemo(() => {
@@ -592,8 +566,8 @@ export function WhatIf({ private_profile_id, whatIfEnabled }: { private_profile_
           />
         );
       } else {
-        // A stored group - handle collapsed state using its name
-        const isCollapsed = collapsedGroups.has(group.groupName);
+        // A stored group: while collapsed it shows one column
+        const isCollapsed = collapsedGroups.has(groupKey);
 
         // Add group header
         items.push(
@@ -602,7 +576,7 @@ export function WhatIf({ private_profile_id, whatIfEnabled }: { private_profile_
             groupName={group.groupName}
             columnCount={group.columns.length}
             isCollapsed={isCollapsed}
-            onToggle={() => toggleGroup(group.groupName)}
+            onToggle={() => toggleGroup(groupKey)}
           />
         );
 
@@ -643,7 +617,7 @@ export function WhatIf({ private_profile_id, whatIfEnabled }: { private_profile_
         </Text>
       )}
       {/* Expand/Collapse All Buttons */}
-      {Object.keys(groupedColumns).filter(isColumnGroupKey).length > 0 && (
+      {storedGroupKeys.length > 0 && (
         <HStack gap={2} justifyContent="flex-end" w="100%" px={2} py={2}>
           <Button variant="ghost" size="sm" onClick={expandAll} colorPalette="blue">
             <Icon as={LuChevronDown} mr={2} /> Expand All

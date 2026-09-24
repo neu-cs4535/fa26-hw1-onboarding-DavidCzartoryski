@@ -149,7 +149,8 @@ test.describe("Gradebook What-If", () => {
     await gotoStudentGradebook(page);
 
     // Group headers are real disclosure buttons: focusable, Enter toggles, state announced.
-    const groupToggle = page.getByRole("button", { name: /assignments\.\.\./i }).first();
+    // Labelled with the group's own name and its column count ("Test Assignment · 2").
+    const groupToggle = page.getByRole("button", { name: /Test Assignment · \d+/ }).first();
     await expect(groupToggle).toBeVisible();
     const expandedBefore = await groupToggle.getAttribute("aria-expanded");
     await groupToggle.focus();
