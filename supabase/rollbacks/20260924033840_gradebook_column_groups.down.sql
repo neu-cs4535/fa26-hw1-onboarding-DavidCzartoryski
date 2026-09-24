@@ -16,7 +16,8 @@
 -- It archives before it drops: every group and its member columns are kept in
 -- rollback_archive, a schema PostgREST does not expose (config.toml lists public,
 -- graphql_public, pgmq_public), so re-applying later can restore instructors' edits instead of
--- re-deriving them from slugs.
+-- re-deriving them from slugs. The backfill's own record of the columns it grouped differently
+-- from the heuristic, backfill_audit.gradebook_column_group_departures, is kept as well.
 --
 -- Nothing else is lost: columns keep their sort_order (their current left-to-right order), and
 -- the five functions the migrations replaced (reorder, auto-layout, Move Left, Move Right, and
@@ -626,6 +627,11 @@ $function$
 ;
 
 DROP FUNCTION public.gradebook_column_groups_backfill(bigint);
+-- The backfill's record, backfill_audit.gradebook_column_group_departures, stays with the other
+-- archives. The functions that computed it go, since they read the helpers dropped below.
+DROP FUNCTION backfill_audit.record_departures(bigint[]);
+DROP FUNCTION backfill_audit.compare_with_heuristic(bigint[]);
+DROP FUNCTION backfill_audit.heuristic_family(text);
 DROP FUNCTION public.gradebook_columns_inherit_group();
 DROP FUNCTION public.gradebook_columns_repair_group_order();
 DROP FUNCTION public.gradebook_columns_apply_order(bigint, bigint[]);

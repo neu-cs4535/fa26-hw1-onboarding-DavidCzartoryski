@@ -53,7 +53,8 @@ INSERT INTO public.classes (name, slug) VALUES
   ('Legacy course', 'test-legacy'),
   ('Tie course', 'test-ties'),
   ('New course', 'test-new'),
-  ('Other course', 'test-other');
+  ('Other course', 'test-other'),
+  ('Audit course', 'test-audit');
 
 -- ---------------------------------------------------------------------------------------------
 -- The backfill, on a course built the way it would have looked before the migration
@@ -108,7 +109,34 @@ SELECT is(
   'backfill never moves a column'
 );
 
+-- The backfill's record: every column it grouped differently from the heuristic, and why.
+SELECT is(
+  (SELECT string_agg(d.slug || ':' || array_to_string(d.reasons, '+'), ' ' ORDER BY d.sort_order)
+   FROM backfill_audit.gradebook_column_group_departures d
+   WHERE d.gradebook_id = pg_temp.gid('test-legacy')),
+  'quiz-1:F1 quiz-2:F1 quiz-4:F1 meets:F4 approaching:F4 '
+  || 'assignment-hw1:F8 assignment-hw2:F8 assignment-final:F8 final-exam:F9 final-grade:F9',
+  'the record lists exactly the columns grouped differently from the heuristic, each with its reason'
+);
+
+-- "Before" is the heuristic's output in the format of tests/unit/legacy-column-grouping.test.ts.
+SELECT is(
+  (SELECT string_agg(d.slug || ': ' || d.heuristic_group || ' -> ' || d.backfill_group, ' | ' ORDER BY d.sort_order)
+   FROM backfill_audit.gradebook_column_group_departures d
+   WHERE d.column_id IN (pg_temp.col('test-legacy', 'quiz-1'), pg_temp.col('test-legacy', 'quiz-4'),
+                         pg_temp.col('test-legacy', 'assignment-final'), pg_temp.col('test-legacy', 'final-grade'))),
+  'quiz-1: Quiz[quiz-1,quiz-2] -> Quiz[quiz-1,quiz-2,quiz-4] | quiz-4: quiz-4 -> Quiz[quiz-1,quiz-2,quiz-4] | '
+  || 'assignment-final: Assignment[assignment-hw1,assignment-hw2,assignment-final] -> assignment-final | '
+  || 'final-grade: Final[final-exam,final-grade] -> final-grade',
+  'the record shows each column''s group before and after'
+);
+
 SELECT is(public.gradebook_column_groups_backfill(pg_temp.gid('test-legacy')), 0, 'a second backfill is a no-op');
+SELECT is(
+  (SELECT count(*) FROM backfill_audit.gradebook_column_group_departures WHERE gradebook_id = pg_temp.gid('test-legacy')),
+  10::bigint,
+  'a second backfill leaves the record alone'
+);
 
 -- F6: a NULL sort_order counts as 0 but no longer collides with the column that really is at 0.
 SELECT set_config('pawtograder.bypass_sort_order_trigger_' || pg_temp.gid('test-ties'), 'true', true);
@@ -118,6 +146,38 @@ SELECT pg_temp.add('test-ties', 'quiz-3', 'Quiz 3', 1);
 SELECT set_config('pawtograder.bypass_sort_order_trigger_' || pg_temp.gid('test-ties'), 'false', true);
 SELECT public.gradebook_column_groups_backfill(pg_temp.gid('test-ties'));
 SELECT is(pg_temp.layout('test-ties'), 'Quiz:quiz-1 Quiz:quiz-2 Quiz:quiz-3', 'F6: a NULL sort_order does not split a family');
+SELECT is(
+  (SELECT string_agg(d.slug || ': ' || d.heuristic_group || ' ' || array_to_string(d.reasons, '+'), ' | ' ORDER BY d.column_id)
+   FROM backfill_audit.gradebook_column_group_departures d
+   WHERE d.gradebook_id = pg_temp.gid('test-ties')),
+  'quiz-1: quiz-1 F6 | quiz-2: Quiz[quiz-2,quiz-3] F6 | quiz-3: Quiz[quiz-2,quiz-3] F6',
+  'F6 is recorded, and the heuristic side reproduces the NULL collision'
+);
+
+-- The check itself: a grouping the heuristic never produced, with no listed reason behind it.
+SELECT pg_temp.add('test-audit', 'alpha', 'Alpha', 0);
+SELECT pg_temp.add('test-audit', 'beta', 'Beta', 1);
+SELECT pg_temp.add('test-audit', 'gamma', 'Gamma', 2);
+INSERT INTO public.gradebook_column_groups (class_id, gradebook_id, name)
+VALUES (pg_temp.cid('test-audit'), pg_temp.gid('test-audit'), 'Made up');
+UPDATE public.gradebook_columns SET group_id = pg_temp.grp('test-audit', 'Made up')
+WHERE id IN (pg_temp.col('test-audit', 'alpha'), pg_temp.col('test-audit', 'beta'));
+SELECT is(
+  (SELECT string_agg(x.slug || ':' || array_to_string(x.reasons, '+'), ' ' ORDER BY x.sort_order)
+   FROM backfill_audit.compare_with_heuristic(ARRAY[pg_temp.gid('test-audit')]) x),
+  'alpha:unexplained beta:unexplained',
+  'the comparison flags a difference no listed failure explains, and only the columns it touches'
+);
+SELECT throws_ok(
+  $$SELECT backfill_audit.record_departures(ARRAY[pg_temp.gid('test-audit')])$$,
+  'P0001', NULL, 'an unexplained difference stops the backfill'
+);
+
+SELECT ok(
+  NOT has_schema_privilege('anon', 'backfill_audit', 'USAGE')
+    AND NOT has_schema_privilege('authenticated', 'backfill_audit', 'USAGE'),
+  'no API role can reach backfill_audit'
+);
 
 ALTER TABLE public.gradebook_columns ENABLE TRIGGER gradebook_columns_inherit_group_tr;
 

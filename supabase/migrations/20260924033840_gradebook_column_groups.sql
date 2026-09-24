@@ -1064,6 +1064,274 @@ END;
 $function$;
 
 -- ---------------------------------------------------------------------------------------------
+-- The backfill's check against the heuristic, and its record of every difference
+--
+-- The backfill below claims to reproduce the render-time heuristic except at the failures the PR
+-- lists. This section checks that claim on every gradebook the backfill runs over, not only on
+-- the seeded course. It rebuilds the heuristic's grouping from the same rows, compares it with
+-- the groups the backfill wrote, and records each column that ended up grouped differently
+-- together with the failures that explain the difference: F1 (a hole in sort_order), F4
+-- (computed from the same inputs), F6 (a tied or NULL sort_order), F8 (two-part assignment
+-- slugs) and F9 (computed from its own family). A difference none of them explains stops the
+-- backfill, and with it the migration. Group names are not compared, because most of them change
+-- on purpose (F2, F3).
+--
+-- It all lives in backfill_audit, a schema PostgREST does not expose (config.toml lists public,
+-- graphql_public, pgmq_public). The heuristic's slug rules below are the old behavior, kept only
+-- to compare against; nothing calls them at render time and no API role can reach them. The
+-- record outlives the migration, and the rollback keeps it too: it is the list of columns an
+-- instructor might ask about.
+-- ---------------------------------------------------------------------------------------------
+
+CREATE SCHEMA IF NOT EXISTS backfill_audit;
+REVOKE ALL ON SCHEMA backfill_audit FROM PUBLIC, anon, authenticated;
+
+CREATE TABLE IF NOT EXISTS backfill_audit.gradebook_column_group_departures (
+  column_id bigint PRIMARY KEY,
+  class_id bigint NOT NULL,
+  gradebook_id bigint NOT NULL,
+  slug text,
+  sort_order integer,
+  heuristic_group text NOT NULL,
+  backfill_group text NOT NULL,
+  reasons text[] NOT NULL,
+  recorded_at timestamptz NOT NULL DEFAULT now()
+);
+REVOKE ALL ON TABLE backfill_audit.gradebook_column_group_departures FROM PUBLIC, anon, authenticated;
+
+COMMENT ON TABLE backfill_audit.gradebook_column_group_departures IS
+  'One row per column that the latest gradebook_column_groups_backfill() of its gradebook grouped '
+  'differently from the render-time slug heuristic. heuristic_group and backfill_group show the '
+  'column''s group on each side as "Title[slug,slug]", or the bare slug for a column on its own. '
+  'reasons lists the failures from the PR that explain the difference (F1, F4, F6, F8, F9).';
+
+-- The heuristic's family key, exactly as the memo computed it: "assignment-<type>" for
+-- assignment-<type>-*, otherwise everything before the first "-", or "other" for an empty slug.
+-- gradebook_column_family is this plus the F8 departure.
+CREATE OR REPLACE FUNCTION backfill_audit.heuristic_family(p_slug text)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+SET search_path = public, pg_temp
+AS $$
+  SELECT CASE
+    WHEN split_part(p_slug, '-', 1) = 'assignment' AND cardinality(string_to_array(p_slug, '-')) >= 3
+      THEN 'assignment-' || split_part(p_slug, '-', 2)
+    ELSE COALESCE(NULLIF(split_part(p_slug, '-', 1), ''), 'other')
+  END;
+$$;
+
+-- Every column in the given gradebooks whose group differs between the heuristic and the stored
+-- groups, with the reasons that explain it, or {unexplained}.
+--
+-- Both groupings cut the same left-to-right sequence into runs: the heuristic sorted by
+-- sort_order alone (NULL read as 0), and TableController loaded the columns ordered by id, so
+-- ties fell in id order, which is (COALESCE(sort_order, 0), id), the order the backfill uses.
+-- Comparing two such cuttings only needs the neighboring pairs where one side cuts and the other
+-- doesn't:
+--
+--   * The heuristic kept a pair together and the backfill separated it: F8 if the new family key
+--     differs, F9 if either column is computed from a column of its own family.
+--   * The heuristic separated a pair and the backfill joined it: F1 (same family, hole in
+--     sort_order), F6 (same family, same sort_order), F8 (the family keys differ only under the
+--     heuristic's rule), F4 (computed from exactly the same columns).
+--
+-- A column is reported when such a pair lies inside or at the edge of its group on either side.
+CREATE OR REPLACE FUNCTION backfill_audit.compare_with_heuristic(p_gradebook_ids bigint[])
+RETURNS TABLE (
+  column_id bigint,
+  class_id bigint,
+  gradebook_id bigint,
+  slug text,
+  sort_order integer,
+  heuristic_group text,
+  backfill_group text,
+  reasons text[]
+)
+LANGUAGE sql
+STABLE
+SET search_path = public, pg_temp
+AS $$
+  WITH cols AS (
+    SELECT
+      gc.id,
+      gc.class_id,
+      gc.gradebook_id,
+      gc.slug,
+      gc.sort_order,
+      gc.group_id,
+      g.name AS group_name,
+      COALESCE(gc.sort_order, 0) AS so,
+      row_number() OVER (PARTITION BY gc.gradebook_id ORDER BY COALESCE(gc.sort_order, 0), gc.id) AS pos,
+      backfill_audit.heuristic_family(gc.slug) AS old_family,
+      public.gradebook_column_family(gc.slug) AS new_family,
+      public.gradebook_column_dependency_ids(gc.dependencies) AS deps,
+      EXISTS (
+        SELECT 1
+        FROM public.gradebook_columns dep
+        WHERE dep.id = ANY (public.gradebook_column_dependency_ids(gc.dependencies))
+          AND dep.id <> gc.id
+          AND dep.gradebook_id = gc.gradebook_id
+          AND public.gradebook_column_family(dep.slug) = public.gradebook_column_family(gc.slug)
+      ) AS computed_from_own_family
+    FROM public.gradebook_columns gc
+    LEFT JOIN public.gradebook_column_groups g ON g.id = gc.group_id
+    WHERE gc.gradebook_id = ANY (p_gradebook_ids)
+  ),
+  -- The heuristic's runs, cut where the memo cut them: at a new family, or wherever sort_order is
+  -- not the previous one plus one (the memo also treated a previous sort_order of -1 as adjacent).
+  runs AS (
+    SELECT
+      c.*,
+      sum(CASE
+            WHEN c.prev_family IS NULL
+              OR c.old_family <> c.prev_family
+              OR NOT (c.prev_so = -1 OR c.so = c.prev_so + 1)
+            THEN 1 ELSE 0
+          END) OVER (PARTITION BY c.gradebook_id ORDER BY c.pos) AS old_run
+    FROM (
+      SELECT
+        cols.*,
+        lag(cols.old_family) OVER w AS prev_family,
+        lag(cols.so) OVER w AS prev_so
+      FROM cols
+      WINDOW w AS (PARTITION BY cols.gradebook_id ORDER BY cols.pos)
+    ) c
+  ),
+  -- Each column's group on either side, as a range of positions and as "Title[slug,slug]".
+  spans AS (
+    SELECT
+      r.*,
+      min(r.pos) OVER old_w AS old_lo,
+      max(r.pos) OVER old_w AS old_hi,
+      CASE WHEN r.group_id IS NULL THEN r.pos ELSE min(r.pos) OVER new_w END AS new_lo,
+      CASE WHEN r.group_id IS NULL THEN r.pos ELSE max(r.pos) OVER new_w END AS new_hi,
+      CASE
+        WHEN count(*) OVER old_w > 1
+          THEN public.gradebook_column_family_title(r.old_family) || '[' || string_agg(r.slug, ',') OVER old_all || ']'
+        ELSE r.slug
+      END AS heuristic_group,
+      CASE
+        WHEN r.group_id IS NULL THEN r.slug
+        ELSE r.group_name || '[' || string_agg(r.slug, ',') OVER new_all || ']'
+      END AS backfill_group
+    FROM runs r
+    WINDOW
+      old_w AS (PARTITION BY r.gradebook_id, r.old_run),
+      old_all AS (PARTITION BY r.gradebook_id, r.old_run ORDER BY r.pos
+                  ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),
+      new_w AS (PARTITION BY r.gradebook_id, r.group_id),
+      new_all AS (PARTITION BY r.gradebook_id, r.group_id ORDER BY r.pos
+                  ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+  ),
+  pairs AS (
+    SELECT
+      a.gradebook_id,
+      a.pos AS left_pos,
+      CASE
+        WHEN a.old_run = b.old_run AND NOT COALESCE(a.group_id = b.group_id, false) THEN
+          array_remove(ARRAY[
+            CASE WHEN a.new_family <> b.new_family THEN 'F8' END,
+            CASE WHEN a.computed_from_own_family OR b.computed_from_own_family THEN 'F9' END
+          ], NULL)
+        WHEN a.old_run <> b.old_run AND COALESCE(a.group_id = b.group_id, false) THEN
+          array_remove(ARRAY[
+            CASE WHEN a.old_family = b.old_family AND a.new_family = b.new_family AND b.so > a.so + 1 THEN 'F1' END,
+            CASE WHEN a.old_family = b.old_family AND a.new_family = b.new_family AND b.so = a.so THEN 'F6' END,
+            CASE WHEN a.old_family <> b.old_family AND a.new_family = b.new_family THEN 'F8' END,
+            CASE WHEN a.deps IS NOT NULL AND a.deps = b.deps THEN 'F4' END
+          ], NULL)
+      END AS reasons
+    FROM spans a
+    JOIN spans b ON b.gradebook_id = a.gradebook_id AND b.pos = a.pos + 1
+  ),
+  differences AS (
+    SELECT
+      p.gradebook_id,
+      p.left_pos,
+      CASE WHEN cardinality(p.reasons) = 0 THEN ARRAY['unexplained'] ELSE p.reasons END AS reasons
+    FROM pairs p
+    WHERE p.reasons IS NOT NULL
+  )
+  SELECT
+    s.id,
+    s.class_id,
+    s.gradebook_id,
+    s.slug,
+    s.sort_order,
+    s.heuristic_group,
+    s.backfill_group,
+    ARRAY(
+      SELECT DISTINCT reason
+      FROM differences d
+      CROSS JOIN LATERAL unnest(d.reasons) AS reason
+      WHERE d.gradebook_id = s.gradebook_id
+        AND ((d.left_pos + 1 >= s.old_lo AND d.left_pos <= s.old_hi)
+          OR (d.left_pos + 1 >= s.new_lo AND d.left_pos <= s.new_hi))
+      ORDER BY reason
+    )
+  FROM spans s
+  WHERE EXISTS (
+    SELECT 1
+    FROM differences d
+    WHERE d.gradebook_id = s.gradebook_id
+      AND ((d.left_pos + 1 >= s.old_lo AND d.left_pos <= s.old_hi)
+        OR (d.left_pos + 1 >= s.new_lo AND d.left_pos <= s.new_hi))
+  )
+  ORDER BY s.gradebook_id, s.pos;
+$$;
+
+-- Replace the record for the given gradebooks with what compare_with_heuristic finds now, and
+-- stop if any difference is unexplained. Returns the number of columns recorded.
+CREATE OR REPLACE FUNCTION backfill_audit.record_departures(p_gradebook_ids bigint[])
+RETURNS integer
+LANGUAGE plpgsql
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_recorded integer;
+  v_unexplained integer;
+  v_examples text;
+BEGIN
+  DELETE FROM backfill_audit.gradebook_column_group_departures d
+  WHERE d.gradebook_id = ANY (p_gradebook_ids);
+
+  INSERT INTO backfill_audit.gradebook_column_group_departures
+    (column_id, class_id, gradebook_id, slug, sort_order, heuristic_group, backfill_group, reasons)
+  SELECT x.column_id, x.class_id, x.gradebook_id, x.slug, x.sort_order, x.heuristic_group, x.backfill_group, x.reasons
+  FROM backfill_audit.compare_with_heuristic(p_gradebook_ids) x;
+  GET DIAGNOSTICS v_recorded = ROW_COUNT;
+
+  SELECT count(*) INTO v_unexplained
+  FROM backfill_audit.gradebook_column_group_departures d
+  WHERE d.gradebook_id = ANY (p_gradebook_ids) AND 'unexplained' = ANY (d.reasons);
+
+  IF v_unexplained > 0 THEN
+    SELECT string_agg(format('gradebook %s: %s was %s, now %s', u.gradebook_id, u.slug, u.heuristic_group, u.backfill_group), '; ')
+    INTO v_examples
+    FROM (
+      SELECT d.*
+      FROM backfill_audit.gradebook_column_group_departures d
+      WHERE d.gradebook_id = ANY (p_gradebook_ids) AND 'unexplained' = ANY (d.reasons)
+      ORDER BY d.gradebook_id, d.sort_order, d.column_id
+      LIMIT 5
+    ) u;
+    RAISE EXCEPTION 'column groups backfill: % columns are grouped differently from the slug heuristic for no listed reason (%)',
+      v_unexplained, v_examples
+      USING HINT = 'Every difference must be one of F1, F4, F6, F8 or F9. See backfill_audit.compare_with_heuristic.';
+  END IF;
+
+  RAISE NOTICE 'column groups backfill: % columns grouped differently from the slug heuristic, each for a listed reason; see backfill_audit.gradebook_column_group_departures',
+    v_recorded;
+  RETURN v_recorded;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION backfill_audit.heuristic_family(text) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION backfill_audit.compare_with_heuristic(bigint[]) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION backfill_audit.record_departures(bigint[]) FROM PUBLIC, anon, authenticated;
+
+-- ---------------------------------------------------------------------------------------------
 -- Backfill
 --
 -- Reads slugs, names and dependencies once per gradebook, so nothing has to read them at render
@@ -1078,6 +1346,9 @@ $function$;
 --
 -- It starts from exactly what the render-time heuristic produced and departs from it only where
 -- the heuristic was wrong; each departure is labelled (F1, F2, F3, F4, F6, F8, F9) and listed in the PR.
+-- Before it returns, it checks that on the gradebooks it just grouped: no column moved, and
+-- backfill_audit.record_departures (above) finds a listed reason for every column grouped
+-- differently. Either failure raises, so nothing it did is kept.
 --
 --   1. Order each gradebook's columns by (sort_order, id) and give each a position 1..n. A NULL
 --      sort_order counts as 0 here, as everywhere, but no longer collides with another column,
@@ -1117,6 +1388,8 @@ DECLARE
   v_created integer := 0;
   v_group record;
   v_group_id bigint;
+  v_gradebook_ids bigint[];
+  v_moved integer;
 BEGIN
   -- Qualified with pg_temp throughout: this runs as the table owner, and an unqualified name
   -- would resolve to a public table of the same name first.
@@ -1127,6 +1400,7 @@ BEGIN
     gc.id,
     gc.gradebook_id,
     g.class_id,
+    gc.sort_order,
     row_number() OVER (PARTITION BY gc.gradebook_id ORDER BY COALESCE(gc.sort_order, 0), gc.id) AS pos,
     public.gradebook_column_family(gc.slug) AS family,
     public.gradebook_column_dependency_ids(gc.dependencies) AS deps,
@@ -1259,6 +1533,20 @@ BEGIN
   FROM pg_temp._gcg_runs r
   JOIN pg_temp._gcg_groups g ON g.gradebook_id = r.gradebook_id AND g.run = r.run
   WHERE gc.id = r.id;
+
+  SELECT array_agg(DISTINCT c.gradebook_id) INTO v_gradebook_ids FROM pg_temp._gcg_columns c;
+
+  IF v_gradebook_ids IS NOT NULL THEN
+    SELECT count(*) INTO v_moved
+    FROM pg_temp._gcg_columns c
+    JOIN public.gradebook_columns gc ON gc.id = c.id
+    WHERE gc.sort_order IS DISTINCT FROM c.sort_order;
+    IF v_moved > 0 THEN
+      RAISE EXCEPTION 'column groups backfill: % columns changed sort_order, and the backfill must never move a column', v_moved;
+    END IF;
+
+    PERFORM backfill_audit.record_departures(v_gradebook_ids);
+  END IF;
 
   DROP TABLE pg_temp._gcg_columns, pg_temp._gcg_runs, pg_temp._gcg_groups;
   RETURN v_created;
