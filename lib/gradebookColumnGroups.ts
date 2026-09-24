@@ -4,7 +4,8 @@
  * Which group a column is in is data (`gradebook_columns.group_id` → `gradebook_column_groups`);
  * nothing here looks at slugs. This only decides layout: a group is drawn where its first member
  * is, with all of its members after it in `sort_order` order, and an ungrouped column is drawn
- * as a group of one, which the gradebook renders without a header.
+ * as a group of one, which the gradebook renders without a header. A stored group always gets a
+ * header, even with one member: an instructor made it, so it should be visible and editable.
  *
  * The database keeps each group's members adjacent in `sort_order` (see
  * `gradebook_columns_make_groups_contiguous`), so anchoring at the first member only changes
@@ -25,6 +26,16 @@ export type GradebookColumnGrouping<C> = Record<string, { groupName: string; col
 /** Record keys are never integer-like, so JS object key order is insertion (display) order. */
 export function gradebookGroupKey(column: Pick<GroupableGradebookColumn, "id" | "group_id">, hasGroup: boolean) {
   return hasGroup && column.group_id != null ? `group-${column.group_id}` : `column-${column.id}`;
+}
+
+/** True for a stored group; false for an ungrouped column drawn on its own. */
+export function isColumnGroupKey(key: string) {
+  return key.startsWith("group-");
+}
+
+/** The gradebook_column_groups id behind a group key, or null for an ungrouped column. */
+export function columnGroupIdFromKey(key: string): number | null {
+  return isColumnGroupKey(key) ? Number(key.slice("group-".length)) : null;
 }
 
 export function groupGradebookColumns<C extends GroupableGradebookColumn>(

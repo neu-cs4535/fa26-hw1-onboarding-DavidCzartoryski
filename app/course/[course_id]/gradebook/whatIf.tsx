@@ -17,7 +17,7 @@ import {
   useGradebookWhatIf,
   useWhatIfGrade
 } from "@/hooks/useGradebookWhatIf";
-import { groupGradebookColumns } from "@/lib/gradebookColumnGroups";
+import { groupGradebookColumns, isColumnGroupKey } from "@/lib/gradebookColumnGroups";
 import { GradebookColumn } from "@/utils/supabase/DatabaseTypes";
 import {
   Accordion,
@@ -473,7 +473,7 @@ function GroupHeader({
           <HStack as="span" gap={2}>
             <Icon as={isCollapsed ? LuChevronRight : LuChevronDown} boxSize={4} color="fg.muted" aria-hidden="true" />
             <Text as="span" fontWeight="bold" fontSize="sm" color="fg.muted">
-              {columnCount} {pluralize(groupName.charAt(0).toUpperCase() + groupName.slice(1))}...
+              {columnCount} {pluralize(groupName.charAt(0).toUpperCase() + groupName.slice(1), columnCount)}...
             </Text>
           </HStack>
         </HStack>
@@ -543,7 +543,7 @@ export function WhatIf({ private_profile_id, whatIfEnabled }: { private_profile_
   // whole table after "Expand all" as soon as any column changed, e.g. after a Move Left.)
   const seenGroupNamesRef = useRef<Set<string>>(new Set());
   useEffect(() => {
-    const allGroupKeys = Object.keys(groupedColumns).filter((key) => groupedColumns[key].columns.length > 1);
+    const allGroupKeys = Object.keys(groupedColumns).filter(isColumnGroupKey);
     const baseGroupNames = [...new Set(allGroupKeys.map((key) => groupedColumns[key].groupName))];
     const newGroupNames = new Set(baseGroupNames.filter((name) => !seenGroupNamesRef.current.has(name)));
     seenGroupNamesRef.current = new Set(baseGroupNames);
@@ -570,7 +570,7 @@ export function WhatIf({ private_profile_id, whatIfEnabled }: { private_profile_
 
   // Collapse all groups
   const collapseAll = useCallback(() => {
-    const allGroupKeys = Object.keys(groupedColumns).filter((key) => groupedColumns[key].columns.length > 1);
+    const allGroupKeys = Object.keys(groupedColumns).filter(isColumnGroupKey);
     const baseGroupNames = [...new Set(allGroupKeys.map((key) => groupedColumns[key].groupName))];
     setCollapsedGroups(new Set(baseGroupNames));
   }, [groupedColumns]);
@@ -580,8 +580,8 @@ export function WhatIf({ private_profile_id, whatIfEnabled }: { private_profile_
     const items: JSX.Element[] = [];
 
     Object.entries(groupedColumns).forEach(([groupKey, group]) => {
-      if (group.columns.length === 1) {
-        // Single column - no need for group header
+      if (!isColumnGroupKey(groupKey)) {
+        // Ungrouped column - no group header
         const column = group.columns[0];
         items.push(
           <GradebookCard
@@ -592,7 +592,7 @@ export function WhatIf({ private_profile_id, whatIfEnabled }: { private_profile_
           />
         );
       } else {
-        // Multiple columns - handle collapsed state using base group name
+        // A stored group - handle collapsed state using its name
         const isCollapsed = collapsedGroups.has(group.groupName);
 
         // Add group header
@@ -643,7 +643,7 @@ export function WhatIf({ private_profile_id, whatIfEnabled }: { private_profile_
         </Text>
       )}
       {/* Expand/Collapse All Buttons */}
-      {Object.keys(groupedColumns).filter((key) => groupedColumns[key].columns.length > 1).length > 0 && (
+      {Object.keys(groupedColumns).filter(isColumnGroupKey).length > 0 && (
         <HStack gap={2} justifyContent="flex-end" w="100%" px={2} py={2}>
           <Button variant="ghost" size="sm" onClick={expandAll} colorPalette="blue">
             <Icon as={LuChevronDown} mr={2} /> Expand All

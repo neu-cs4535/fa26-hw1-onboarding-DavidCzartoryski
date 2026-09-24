@@ -1,4 +1,5 @@
--- Rollback for supabase/migrations/20260924033840_gradebook_column_groups.sql.
+-- Rollback for supabase/migrations/20260924033840_gradebook_column_groups.sql and
+-- 20260924045931_gradebook_column_groups_crud.sql, undone together, newest first.
 --
 -- Supabase migrations only run forward, so this is not picked up by `db reset` or `db push`.
 -- To undo the change on a database the migration has already run on:
@@ -15,9 +16,9 @@
 -- public, graphql_public, pgmq_public), so re-applying later can restore edits instead of
 -- re-deriving them from slugs.
 --
--- Nothing else is lost: sort_order was never changed by the backfill, and the reorder and
--- auto-layout functions go back to their previous bodies (identical apart from the punctuation
--- of one comment).
+-- Nothing else is lost: columns keep their sort_order (the current left-to-right order), and
+-- the four functions the migrations replaced (reorder, auto-layout, Move Left, Move Right) go
+-- back to their previous bodies, identical apart from the punctuation of one comment.
 
 BEGIN;
 
@@ -36,6 +37,235 @@ SELECT
 FROM public.gradebook_column_groups g
 LEFT JOIN public.gradebook_columns gc ON gc.group_id = g.id
 GROUP BY g.id;
+
+-- 20260924045931_gradebook_column_groups_crud
+
+DROP TRIGGER gradebook_columns_drop_empty_group_tr ON public.gradebook_columns;
+DROP FUNCTION public.gradebook_column_groups_drop_empty();
+
+-- Previous bodies of Move Left / Move Right.
+CREATE OR REPLACE FUNCTION public.gradebook_column_move_left(p_column_id bigint)
+ RETURNS gradebook_columns
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+  v_gradebook_id bigint;
+  v_col public.gradebook_columns;
+  v_neighbor_id bigint;
+  v_self_order integer;
+  v_neighbor_order integer;
+  v_max integer;
+BEGIN
+  SELECT gradebook_id INTO v_gradebook_id
+    FROM public.gradebook_columns
+   WHERE id = p_column_id;
+
+  IF v_gradebook_id IS NULL THEN
+    RAISE EXCEPTION 'gradebook column % not found', p_column_id;
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(v_gradebook_id);
+
+  IF EXISTS (
+    SELECT 1
+      FROM public.gradebook_columns
+     WHERE gradebook_id = v_gradebook_id
+       AND sort_order IS NULL
+  ) THEN
+    PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || v_gradebook_id::text, 'true', true);
+    BEGIN
+      SELECT COALESCE(MAX(sort_order), -1) INTO v_max
+        FROM public.gradebook_columns
+       WHERE gradebook_id = v_gradebook_id;
+
+      WITH numbered AS (
+        SELECT
+          id,
+          ROW_NUMBER() OVER (ORDER BY id) AS rn
+        FROM public.gradebook_columns
+        WHERE gradebook_id = v_gradebook_id
+          AND sort_order IS NULL
+      )
+      UPDATE public.gradebook_columns gc
+         SET sort_order = v_max + numbered.rn
+        FROM numbered
+       WHERE gc.id = numbered.id;
+    EXCEPTION
+      WHEN OTHERS THEN
+        PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || v_gradebook_id::text, 'false', true);
+        RAISE;
+    END;
+    PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || v_gradebook_id::text, 'false', true);
+  END IF;
+
+  SELECT * INTO v_col
+    FROM public.gradebook_columns
+   WHERE id = p_column_id
+   FOR UPDATE;
+
+  WITH ordered AS (
+    SELECT
+      id,
+      ROW_NUMBER() OVER (ORDER BY sort_order ASC NULLS LAST, id ASC) AS rn
+    FROM public.gradebook_columns
+    WHERE gradebook_id = v_gradebook_id
+  )
+  SELECT o2.id
+    INTO v_neighbor_id
+    FROM ordered o1
+    JOIN ordered o2 ON o2.rn = o1.rn - 1
+   WHERE o1.id = p_column_id;
+
+  IF v_neighbor_id IS NULL THEN
+    RETURN v_col;
+  END IF;
+
+  SELECT sort_order INTO v_neighbor_order
+    FROM public.gradebook_columns
+   WHERE id = v_neighbor_id
+   FOR UPDATE;
+
+  v_self_order := v_col.sort_order;
+
+  PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || v_gradebook_id::text, 'true', true);
+  BEGIN
+    UPDATE public.gradebook_columns
+       SET sort_order = v_neighbor_order
+     WHERE id = p_column_id;
+
+    UPDATE public.gradebook_columns
+       SET sort_order = v_self_order
+     WHERE id = v_neighbor_id;
+  EXCEPTION
+    WHEN OTHERS THEN
+      PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || v_gradebook_id::text, 'false', true);
+      RAISE;
+  END;
+  PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || v_gradebook_id::text, 'false', true);
+
+  SELECT * INTO v_col FROM public.gradebook_columns WHERE id = p_column_id;
+  RETURN v_col;
+END;
+$function$
+
+;
+CREATE OR REPLACE FUNCTION public.gradebook_column_move_right(p_column_id bigint)
+ RETURNS gradebook_columns
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+  v_gradebook_id bigint;
+  v_col public.gradebook_columns;
+  v_neighbor_id bigint;
+  v_self_order integer;
+  v_neighbor_order integer;
+  v_max integer;
+BEGIN
+  SELECT gradebook_id INTO v_gradebook_id
+    FROM public.gradebook_columns
+   WHERE id = p_column_id;
+
+  IF v_gradebook_id IS NULL THEN
+    RAISE EXCEPTION 'gradebook column % not found', p_column_id;
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(v_gradebook_id);
+
+  IF EXISTS (
+    SELECT 1
+      FROM public.gradebook_columns
+     WHERE gradebook_id = v_gradebook_id
+       AND sort_order IS NULL
+  ) THEN
+    PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || v_gradebook_id::text, 'true', true);
+    BEGIN
+      SELECT COALESCE(MAX(sort_order), -1) INTO v_max
+        FROM public.gradebook_columns
+       WHERE gradebook_id = v_gradebook_id;
+
+      WITH numbered AS (
+        SELECT
+          id,
+          ROW_NUMBER() OVER (ORDER BY id) AS rn
+        FROM public.gradebook_columns
+        WHERE gradebook_id = v_gradebook_id
+          AND sort_order IS NULL
+      )
+      UPDATE public.gradebook_columns gc
+         SET sort_order = v_max + numbered.rn
+        FROM numbered
+       WHERE gc.id = numbered.id;
+    EXCEPTION
+      WHEN OTHERS THEN
+        PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || v_gradebook_id::text, 'false', true);
+        RAISE;
+    END;
+    PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || v_gradebook_id::text, 'false', true);
+  END IF;
+
+  SELECT * INTO v_col
+    FROM public.gradebook_columns
+   WHERE id = p_column_id
+   FOR UPDATE;
+
+  WITH ordered AS (
+    SELECT
+      id,
+      ROW_NUMBER() OVER (ORDER BY sort_order ASC NULLS LAST, id ASC) AS rn
+    FROM public.gradebook_columns
+    WHERE gradebook_id = v_gradebook_id
+  )
+  SELECT o2.id
+    INTO v_neighbor_id
+    FROM ordered o1
+    JOIN ordered o2 ON o2.rn = o1.rn + 1
+   WHERE o1.id = p_column_id;
+
+  IF v_neighbor_id IS NULL THEN
+    RETURN v_col;
+  END IF;
+
+  SELECT sort_order INTO v_neighbor_order
+    FROM public.gradebook_columns
+   WHERE id = v_neighbor_id
+   FOR UPDATE;
+
+  v_self_order := v_col.sort_order;
+
+  PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || v_gradebook_id::text, 'true', true);
+  BEGIN
+    UPDATE public.gradebook_columns
+       SET sort_order = v_neighbor_order
+     WHERE id = p_column_id;
+
+    UPDATE public.gradebook_columns
+       SET sort_order = v_self_order
+     WHERE id = v_neighbor_id;
+  EXCEPTION
+    WHEN OTHERS THEN
+      PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || v_gradebook_id::text, 'false', true);
+      RAISE;
+  END;
+  PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || v_gradebook_id::text, 'false', true);
+
+  SELECT * INTO v_col FROM public.gradebook_columns WHERE id = p_column_id;
+  RETURN v_col;
+END;
+$function$
+
+;
+
+
+DROP FUNCTION public.gradebook_column_group_create(bigint, text, bigint[]);
+DROP FUNCTION public.gradebook_column_set_group(bigint, bigint);
+DROP FUNCTION public.gradebook_column_group_move(bigint, integer);
+DROP FUNCTION public.gradebook_column_step(bigint, integer);
+DROP FUNCTION public.gradebook_columns_swap_unit(bigint, text, integer);
+DROP FUNCTION public.gradebook_columns_apply_order(bigint, bigint[]);
+DROP FUNCTION public.gradebook_column_groups_authorize(bigint);
+DROP FUNCTION public.gradebook_columns_display_order(bigint);
+
+-- 20260924033840_gradebook_column_groups
 
 DROP TRIGGER gradebook_columns_inherit_group_tr ON public.gradebook_columns;
 DROP FUNCTION public.gradebook_columns_inherit_group();

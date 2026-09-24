@@ -1722,7 +1722,9 @@ test.describe("Gradebook column reorder (issue #531)", () => {
       await buttonNow.click();
       const moveRightItem = page.getByRole("menuitem", { name: "Move Right", exact: true });
       await expect(moveRightItem).toBeVisible({ timeout: 5_000 });
-      await moveRightItem.click({ force: true });
+      // Not forced: a forced click fires before the menu has finished positioning and can land
+      // beside the item. The surrounding toPass already retries a detached header.
+      await moveRightItem.click({ timeout: 5_000 });
       await expect(async () => {
         const { data: colAfterClick } = await supabase
           .from("gradebook_columns")
@@ -1742,5 +1744,159 @@ test.describe("Gradebook column reorder (issue #531)", () => {
         .single();
       expect(colRestored!.sort_order).toBe(sortOrderBefore);
     }).toPass({ timeout: 5000 });
+  });
+});
+
+// CS 4535 column groups: every group operation an instructor has, driven through the UI, with
+// the stored layout checked after each step. Reordering must never change membership.
+test.describe("Gradebook column group management", () => {
+  test.describe.configure({ mode: "serial" });
+  test.setTimeout(240_000);
+
+  let groupsCourse: Course;
+  let groupsInstructor: TestingUser;
+
+  test.beforeAll(async () => {
+    const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    groupsCourse = await createClass({ name: `Gradebook Groups E2E ${id}` });
+    const users = await createUsersInClass([
+      {
+        name: "Groups Student",
+        email: `groups-student-${id}@pawtograder.net`,
+        role: "student",
+        class_id: groupsCourse.id,
+        useMagicLink: true
+      },
+      {
+        name: "Groups Instructor",
+        email: `groups-instructor-${id}@pawtograder.net`,
+        role: "instructor",
+        class_id: groupsCourse.id,
+        useMagicLink: true
+      }
+    ]);
+    groupsInstructor = users[1];
+    await createAssignmentsAndGradebookColumns({
+      class_id: groupsCourse.id,
+      numAssignments: 4,
+      numManualGradedColumns: 0,
+      manualGradedColumnSlugs: ["participation"],
+      groupConfig: "both"
+    });
+  });
+
+  // "<group or ->:<column>" for the four assignment columns, left to right, as stored.
+  async function assignmentLayout() {
+    const { data: columns } = await supabase
+      .from("gradebook_columns")
+      .select("name, sort_order, group_id")
+      .eq("class_id", groupsCourse.id)
+      .like("name", "Test Assignment %")
+      .order("sort_order");
+    const { data: groups } = await supabase
+      .from("gradebook_column_groups")
+      .select("id, name")
+      .eq("class_id", groupsCourse.id);
+    const groupName = new Map((groups ?? []).map((g) => [g.id, g.name]));
+    return (columns ?? []).map(
+      (c) => `${c.group_id ? groupName.get(c.group_id) : "-"}:${c.name.replace(/^Test Assignment (\d).*$/, "A$1")}`
+    );
+  }
+
+  async function openColumnMenu(page: Page, columnName: string) {
+    const region = page.getByRole("region", { name: "Instructor Gradebook Table" });
+    await region.getByRole("button", { name: "Expand all groups" }).click();
+    await waitForVirtualizerIdle(page);
+    const header = region
+      .locator("thead tr")
+      .filter({ has: page.locator("th").filter({ hasText: "Student Name" }) })
+      .locator("[data-col-id]")
+      .filter({ hasText: columnName });
+    await header.scrollIntoViewIfNeeded();
+    await header.getByRole("button", { name: "Column options" }).click();
+  }
+
+  async function openGroupMenu(page: Page, groupName: string) {
+    const region = page.getByRole("region", { name: "Instructor Gradebook Table" });
+    await region.getByRole("button", { name: `Group options for ${groupName}` }).click();
+  }
+
+  test("create, assign, rename, move and ungroup groups; reordering keeps membership", async ({ page }) => {
+    await loginAsUser(page, groupsInstructor, groupsCourse);
+    await page
+      .locator("#course-nav")
+      .getByRole("link")
+      .filter({ hasText: /^Gradebook$/ })
+      .click();
+    await page.waitForLoadState("networkidle");
+    await waitForVirtualizerIdle(page);
+
+    // New assignment columns get a default group when they are created.
+    await expect
+      .poll(assignmentLayout)
+      .toEqual(["Test Assignment:A1", "Test Assignment:A2", "Test Assignment:A3", "Test Assignment:A4"]);
+
+    // Create a group from one column. It leaves its old group and sits just before it.
+    await openColumnMenu(page, "Test Assignment 1");
+    await page.getByRole("menuitem", { name: "Group…" }).click();
+    await page.getByLabel("Group", { exact: true }).selectOption({ label: "New group…" });
+    await page.getByLabel("New group name").fill("Problem Sets");
+    await page.getByRole("button", { name: "Save" }).click();
+    await expect
+      .poll(assignmentLayout)
+      .toEqual(["Problem Sets:A1", "Test Assignment:A2", "Test Assignment:A3", "Test Assignment:A4"]);
+
+    // Move a column into an existing group: it goes to the end of that group.
+    await openColumnMenu(page, "Test Assignment 2");
+    await page.getByRole("menuitem", { name: "Group…" }).click();
+    await page.getByLabel("Group", { exact: true }).selectOption({ label: "Problem Sets" });
+    await page.getByRole("button", { name: "Save" }).click();
+    await expect
+      .poll(assignmentLayout)
+      .toEqual(["Problem Sets:A1", "Problem Sets:A2", "Test Assignment:A3", "Test Assignment:A4"]);
+
+    // A duplicate name is refused, case-insensitively, and nothing changes.
+    await openGroupMenu(page, "Problem Sets");
+    await page.getByRole("menuitem", { name: "Rename Group" }).click();
+    await page.getByLabel("Group name").fill("test assignment");
+    await page.getByRole("button", { name: "Save" }).click();
+    await expect(page.getByText('There is already a group named "test assignment"')).toBeVisible();
+
+    // Rename.
+    await page.getByLabel("Group name").fill("Homework");
+    await page.getByRole("button", { name: "Save" }).click();
+    await expect
+      .poll(assignmentLayout)
+      .toEqual(["Homework:A1", "Homework:A2", "Test Assignment:A3", "Test Assignment:A4"]);
+
+    // Move a whole group past its neighbor group.
+    await openGroupMenu(page, "Homework");
+    await page.getByRole("menuitem", { name: "Move Group Right" }).click();
+    await expect
+      .poll(assignmentLayout)
+      .toEqual(["Test Assignment:A3", "Test Assignment:A4", "Homework:A1", "Homework:A2"]);
+
+    // Move Right on a column stays inside its group, and stops at the group's edge.
+    await openColumnMenu(page, "Test Assignment 3");
+    await page.getByRole("menuitem", { name: "Move Right", exact: true }).click();
+    await expect
+      .poll(assignmentLayout)
+      .toEqual(["Test Assignment:A4", "Test Assignment:A3", "Homework:A1", "Homework:A2"]);
+    await openColumnMenu(page, "Test Assignment 3");
+    await page.getByRole("menuitem", { name: "Move Right", exact: true }).click();
+    await expect(page.getByText("is already the last column in its group").first()).toBeAttached();
+    await expect
+      .poll(assignmentLayout)
+      .toEqual(["Test Assignment:A4", "Test Assignment:A3", "Homework:A1", "Homework:A2"]);
+
+    // Ungroup: the group goes, its columns stay where they are.
+    await openGroupMenu(page, "Homework");
+    await page.getByRole("menuitem", { name: "Ungroup" }).click();
+    await expect.poll(assignmentLayout).toEqual(["Test Assignment:A4", "Test Assignment:A3", "-:A1", "-:A2"]);
+    const { data: remaining } = await supabase
+      .from("gradebook_column_groups")
+      .select("name")
+      .eq("class_id", groupsCourse.id);
+    expect((remaining ?? []).map((g) => g.name)).toEqual(["Test Assignment"]);
   });
 });

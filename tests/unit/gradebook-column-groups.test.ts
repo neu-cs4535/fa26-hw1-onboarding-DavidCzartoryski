@@ -3,7 +3,12 @@
  * groups the instructor gradebook and the student what-if view render. The point of the function
  * is that it only lays out rows it was handed: none of these cases can be decided from a slug.
  */
-import { groupGradebookColumns, groupKeyByColumnId } from "@/lib/gradebookColumnGroups";
+import {
+  columnGroupIdFromKey,
+  groupGradebookColumns,
+  groupKeyByColumnId,
+  isColumnGroupKey
+} from "@/lib/gradebookColumnGroups";
 
 type Col = { id: number; name: string; slug: string; sort_order: number | null; group_id: number | null };
 
@@ -78,6 +83,15 @@ describe("groupGradebookColumns", () => {
     // Integer-like object keys would be reordered by the JS engine; keys are always prefixed.
     const columns = [col(30, 0, null), col(2, 1, null), col(10, 2, null)];
     expect(Object.keys(groupGradebookColumns(columns, groups))).toEqual(["column-30", "column-2", "column-10"]);
+  });
+
+  it("tells a stored group of one from an ungrouped column", () => {
+    // Both have one column; only the stored group gets a header and a group menu.
+    const grouping = groupGradebookColumns([col(1, 0, 1), col(2, 1, null)], groups);
+    expect(Object.keys(grouping).map((key) => [key, isColumnGroupKey(key), columnGroupIdFromKey(key)])).toEqual([
+      ["group-1", true, 1],
+      ["column-2", false, null]
+    ]);
   });
 
   it("builds a column -> group key lookup", () => {
